@@ -42,7 +42,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         max_pixels=1920*1080, height=None, width=None,
         height_division_factor=16, width_division_factor=16,
         num_frames=81, time_division_factor=4, time_division_remainder=1,
-        frame_rate=24, fix_frame_rate=False,
+        frame_rate=24, fix_frame_rate=False, random_start=True,
     ):
         return RouteByType(operator_map=[
             (str, ToAbsolutePath(base_path) >> RouteByExtensionName(operator_map=[
@@ -50,11 +50,12 @@ class UnifiedDataset(torch.utils.data.Dataset):
                 (("gif",), LoadGIF(
                     num_frames, time_division_factor, time_division_remainder,
                     frame_processor=ImageCropAndResize(height, width, max_pixels, height_division_factor, width_division_factor),
+                    random_start=random_start,
                 )),
                 (("mp4", "avi", "mov", "wmv", "mkv", "flv", "webm"), LoadVideo(
                     num_frames, time_division_factor, time_division_remainder,
                     frame_processor=ImageCropAndResize(height, width, max_pixels, height_division_factor, width_division_factor),
-                    frame_rate=frame_rate, fix_frame_rate=fix_frame_rate,
+                    frame_rate=frame_rate, fix_frame_rate=fix_frame_rate, random_start=random_start,
                 )),
             ])),
         ])

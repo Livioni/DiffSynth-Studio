@@ -135,7 +135,13 @@ if __name__ == "__main__":
     )
     data_file_keys = args.data_file_keys.split(",")
     special_operator_map = {
-        "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
+        "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(
+            args.num_frames,
+            4,
+            1,
+            frame_processor=ImageCropAndResize(512, 512, None, 16, 16),
+            random_start=args.video_random_start,
+        ),
         "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
     }
     if "input_audio" in data_file_keys:
@@ -156,6 +162,7 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             time_division_factor=4 if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
+            random_start=args.video_random_start,
         ),
         special_operator_map=special_operator_map,
     )

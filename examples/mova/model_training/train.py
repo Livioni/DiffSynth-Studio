@@ -159,6 +159,7 @@ if __name__ == "__main__":
         time_division_remainder=1,
         frame_rate=args.frame_rate,
         fix_frame_rate=True,
+        random_start=args.video_random_start,
     )
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,

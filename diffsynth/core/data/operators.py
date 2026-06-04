@@ -107,12 +107,13 @@ class ToList(DataProcessingOperator):
     
 
 class FrameSamplerByRateMixin:
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_rate=24, fix_frame_rate=False):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_rate=24, fix_frame_rate=False, random_start=False):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         self.frame_rate = frame_rate
         self.fix_frame_rate = fix_frame_rate
+        self.random_start = random_start
 
     def get_reader(self, data: str):
         return imageio.get_reader(data)
@@ -135,6 +136,14 @@ class FrameSamplerByRateMixin:
                 num_frames -= 1
         return num_frames
 
+    def get_start_frame_id(self, reader, num_frames: int) -> int:
+        if not self.random_start:
+            return 0
+        max_start_frame_id = max(int(self.get_available_num_frames(reader)) - int(num_frames), 0)
+        if max_start_frame_id <= 0:
+            return 0
+        return int(torch.randint(0, max_start_frame_id + 1, (1,)).item())
+
     def map_single_frame_id(self, new_sequence_id: int, raw_frame_rate: float, total_raw_frames: int) -> int:
         if not self.fix_frame_rate:
             return new_sequence_id
@@ -146,8 +155,8 @@ class FrameSamplerByRateMixin:
 
 
 class LoadVideo(DataProcessingOperator, FrameSamplerByRateMixin):
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, frame_rate=24, fix_frame_rate=False):
-        FrameSamplerByRateMixin.__init__(self, num_frames, time_division_factor, time_division_remainder, frame_rate, fix_frame_rate)
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, frame_rate=24, fix_frame_rate=False, random_start=True):
+        FrameSamplerByRateMixin.__init__(self, num_frames, time_division_factor, time_division_remainder, frame_rate, fix_frame_rate, random_start)
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
 
@@ -156,8 +165,9 @@ class LoadVideo(DataProcessingOperator, FrameSamplerByRateMixin):
         raw_frame_rate = reader.get_meta_data()['fps']
         num_frames = self.get_num_frames(reader)
         total_raw_frames = reader.count_frames()
+        start_frame_id = self.get_start_frame_id(reader, num_frames)
         frames = []
-        for frame_id in range(num_frames):
+        for frame_id in range(start_frame_id, start_frame_id + num_frames):
             frame_id = self.map_single_frame_id(frame_id, raw_frame_rate, total_raw_frames)
             frame = reader.get_data(frame_id)
             frame = Image.fromarray(frame)
@@ -176,10 +186,11 @@ class SequencialProcess(DataProcessingOperator):
 
 
 class LoadGIF(DataProcessingOperator):
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, random_start=True):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
+        self.random_start = random_start
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
 
@@ -191,17 +202,24 @@ class LoadGIF(DataProcessingOperator):
             while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
                 num_frames -= 1
         return num_frames
+
+    def get_start_frame_id(self, total_frames: int, num_frames: int) -> int:
+        if not self.random_start:
+            return 0
+        max_start_frame_id = max(int(total_frames) - int(num_frames), 0)
+        if max_start_frame_id <= 0:
+            return 0
+        return int(torch.randint(0, max_start_frame_id + 1, (1,)).item())
         
     def __call__(self, data: str):
         num_frames = self.get_num_frames(data)
         frames = []
         images = iio.imread(data, mode="RGB")
-        for img in images:
+        start_frame_id = self.get_start_frame_id(len(images), num_frames)
+        for img in images[start_frame_id:start_frame_id + num_frames]:
             frame = Image.fromarray(img)
             frame = self.frame_processor(frame)
             frames.append(frame)
-            if len(frames) >= num_frames:
-                break
         return frames
 
 
