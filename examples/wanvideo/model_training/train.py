@@ -133,11 +133,19 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
+    data_file_keys = args.data_file_keys.split(",")
+    special_operator_map = {
+        "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
+        "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
+    }
+    if "input_audio" in data_file_keys:
+        special_operator_map["input_audio"] = ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000)
+
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
+        data_file_keys=data_file_keys,
         main_data_operator=UnifiedDataset.default_video_operator(
             base_path=args.dataset_base_path,
             max_pixels=args.max_pixels,
@@ -149,11 +157,7 @@ if __name__ == "__main__":
             time_division_factor=4 if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
         ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
-        }
+        special_operator_map=special_operator_map,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,

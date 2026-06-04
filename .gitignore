@@ -13,6 +13,8 @@
 *.msc
 *.mv
 log*.txt
+/world_model_data
+world_model_data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

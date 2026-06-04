@@ -49,7 +49,7 @@ class WandbLogger:
 class ModelLogger:
     def __init__(
         self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x: x,
-        enable_tensorboard_log=False,
+        enable_tensorboard_log=True,
         enable_swanlab_log=False, swanlab_project="DiffSynth-Studio",
         enable_wandb_log=False, wandb_project="DiffSynth-Studio",
     ):
