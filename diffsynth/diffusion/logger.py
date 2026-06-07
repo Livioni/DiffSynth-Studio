@@ -42,6 +42,9 @@ class WandbLogger:
     def log(self, key, value, step):
         self.wandb.log({key: value}, step=step)
 
+    def log_video(self, key, path, step):
+        self.wandb.log({key: self.wandb.Video(path, format="mp4")}, step=step)
+
     def close(self):
         self.wandb.finish()
 
@@ -75,11 +78,31 @@ class ModelLogger:
             self.loggers.append(WandbLogger(project_name=self.wandb_project, log_dir=os.path.join(self.output_path, "wandb_log")))
         self.loggers_initialized = True
 
+    def ensure_loggers_initialized(self):
+        if not self.loggers_initialized:
+            self.init_loggers()
+
+    def log_metrics(self, metrics, step=None):
+        self.ensure_loggers_initialized()
+        step = self.num_steps if step is None else step
+        for key, value in metrics.items():
+            if torch.is_tensor(value):
+                value = value.detach().cpu().item()
+            for logger in self.loggers:
+                logger.log(key, value, step)
+
+    def log_videos(self, videos, step=None):
+        self.ensure_loggers_initialized()
+        step = self.num_steps if step is None else step
+        for key, path in videos.items():
+            for logger in self.loggers:
+                if hasattr(logger, "log_video"):
+                    logger.log_video(key, path, step)
+
     def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, **kwargs):
         self.num_steps += 1
         if accelerator.is_main_process:
-            if not self.loggers_initialized:
-                self.init_loggers()
+            self.ensure_loggers_initialized()
             loss = kwargs.get("loss")
             if loss is not None:
                 for logger in self.loggers:

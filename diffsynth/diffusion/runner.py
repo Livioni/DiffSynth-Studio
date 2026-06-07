@@ -30,6 +30,7 @@ def launch_training_task(
     enable_optimizer_cpu_offload: bool = False,
     cpu_offload_split_threshold: int = None,
     customized_optimizer: str = None,
+    eval_callback = None,
     args = None,
     **kwargs,
 ):
@@ -72,6 +73,11 @@ def launch_training_task(
                 scheduler.step()
                 optimizer.zero_grad()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                if eval_callback is not None and eval_callback.should_run(model_logger.num_steps):
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        eval_callback(accelerator, model, model_logger)
+                    accelerator.wait_for_everyone()
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 

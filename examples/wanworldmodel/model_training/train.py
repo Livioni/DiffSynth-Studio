@@ -1,10 +1,14 @@
 import argparse
 import json
+import math
 import os
 import warnings
 
 import accelerate
+import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 
 from diffsynth.core import UnifiedDataset, WorldModelDataset
 from diffsynth.core.data.operators import ImageCropAndResize
@@ -149,6 +153,42 @@ def build_world_model_dataset(args):
     )
 
 
+def build_eval_dataset(args):
+    if args.eval_dataset_base_path is None or args.eval_dataset_base_path == "":
+        return None
+    if not os.path.isdir(args.eval_dataset_base_path):
+        warnings.warn(f"Eval dataset root does not exist, skip periodic eval: {args.eval_dataset_base_path}")
+        return None
+
+    cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
+    if args.world_model_video_camera not in cameras:
+        cameras = (args.world_model_video_camera,) + cameras
+    dataset = WorldModelDataset(
+        root=args.eval_dataset_base_path,
+        tasks=split_csv(args.world_model_tasks),
+        cameras=cameras,
+        num_frames=args.num_frames,
+        stride=args.world_model_stride,
+        include_depth=args.world_model_include_depth,
+        include_camera_params=args.world_model_include_camera_params,
+        include_failed=args.world_model_include_failed,
+        repeat=1,
+        max_data_items=args.eval_max_samples,
+    )
+    frame_processor = ImageCropAndResize(
+        height=args.height,
+        width=args.width,
+        max_pixels=args.max_pixels,
+        height_division_factor=16,
+        width_division_factor=16,
+    )
+    return WorldModelTrainingDataset(
+        dataset,
+        video_camera=args.world_model_video_camera,
+        frame_processor=frame_processor,
+    )
+
+
 def build_dataset(args):
     dataset_type = args.dataset_type
     if dataset_type == "auto":
@@ -160,6 +200,250 @@ def build_dataset(args):
     if dataset_type == "unified":
         return build_unified_dataset(args)
     raise ValueError(f"Unsupported dataset type: {dataset_type}")
+
+
+def pil_video_to_tensor(video):
+    frames = [np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0 for frame in video]
+    tensor = torch.from_numpy(np.stack(frames, axis=0))
+    return tensor.permute(0, 3, 1, 2).contiguous()
+
+
+def save_pil_video(video, path, fps=4):
+    import imageio.v2 as imageio
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    frames = [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in video]
+    imageio.mimsave(path, frames, fps=fps)
+
+
+def resize_pil_video(video, width, height):
+    if len(video) == 0:
+        return video
+    target_size = (int(width), int(height))
+    if all(frame.size == target_size for frame in video):
+        return video
+    resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+    return [frame.resize(target_size, resample=resample) for frame in video]
+
+
+def ssim_torch(x, y, window_size=11, sigma=1.5):
+    x = x.to(dtype=torch.float32)
+    y = y.to(dtype=torch.float32)
+    channels = x.shape[1]
+    coords = torch.arange(window_size, dtype=torch.float32, device=x.device) - window_size // 2
+    kernel_1d = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+    kernel = kernel_2d.view(1, 1, window_size, window_size).repeat(channels, 1, 1, 1)
+    padding = window_size // 2
+
+    mu_x = F.conv2d(x, kernel, padding=padding, groups=channels)
+    mu_y = F.conv2d(y, kernel, padding=padding, groups=channels)
+    mu_x2 = mu_x.square()
+    mu_y2 = mu_y.square()
+    mu_xy = mu_x * mu_y
+
+    sigma_x2 = F.conv2d(x * x, kernel, padding=padding, groups=channels) - mu_x2
+    sigma_y2 = F.conv2d(y * y, kernel, padding=padding, groups=channels) - mu_y2
+    sigma_xy = F.conv2d(x * y, kernel, padding=padding, groups=channels) - mu_xy
+
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    ssim_map = ((2 * mu_xy + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2)
+    )
+    return ssim_map.mean()
+
+
+class WanWorldModelEvalCallback:
+    def __init__(
+        self,
+        dataset,
+        eval_steps=1000,
+        num_inference_steps=50,
+        num_workers=0,
+        num_videos_to_log=4,
+        video_fps=4,
+        metric_batch_size=4,
+        output_path="./models",
+    ):
+        self.dataset = dataset
+        self.eval_steps = int(eval_steps)
+        self.num_inference_steps = int(num_inference_steps)
+        self.num_videos_to_log = int(num_videos_to_log)
+        self.video_fps = int(video_fps)
+        self.metric_batch_size = int(metric_batch_size)
+        self.output_path = output_path
+        self.dataloader = torch.utils.data.DataLoader(
+            dataset,
+            shuffle=False,
+            collate_fn=lambda x: x[0],
+            num_workers=num_workers,
+        )
+        self.lpips_metric = None
+        self.fid_metric = None
+
+    def should_run(self, step):
+        return self.eval_steps > 0 and step > 0 and step % self.eval_steps == 0
+
+    def _ensure_metrics(self, device):
+        if self.lpips_metric is None:
+            from diffsynth.metrics import LPIPSMetric
+            self.lpips_metric = LPIPSMetric.from_pretrained(
+                net="vgg",
+                device=device,
+                batch_size=self.metric_batch_size,
+            )
+        if self.fid_metric is None:
+            from diffsynth.metrics import FIDMetric
+            self.fid_metric = FIDMetric.from_pretrained(
+                device=device,
+                batch_size=self.metric_batch_size,
+            )
+
+    def _reconstruct_video(self, pipe, video):
+        pipe.load_models_to_device(["vae"])
+        input_video = pipe.preprocess_video(video)
+        latents = pipe.vae.encode(
+            input_video,
+            device=pipe.device,
+            tiled=False,
+            tile_size=(30, 52),
+            tile_stride=(15, 26),
+        ).to(dtype=pipe.torch_dtype, device=pipe.device)
+        decoded = pipe.vae.decode(
+            latents,
+            device=pipe.device,
+            tiled=False,
+            tile_size=(30, 52),
+            tile_stride=(15, 26),
+        )
+        return pipe.vae_output_to_video(decoded)
+
+    def _evaluate_sample(self, pipe, data, sample_id, step, video_paths):
+        x_gt = data["video"]
+        target_height, target_width, target_num_frames = pipe.check_resize_height_width(
+            x_gt[0].size[1],
+            x_gt[0].size[0],
+            len(x_gt),
+            verbose=False,
+        )
+        x_gt = resize_pil_video(x_gt, target_width, target_height)
+        x_pred = pipe(
+            prompt=data["prompt"],
+            negative_prompt="",
+            input_image=x_gt[0],
+            seed=sample_id,
+            rand_device=pipe.device,
+            height=target_height,
+            width=target_width,
+            num_frames=target_num_frames,
+            cfg_scale=1,
+            num_inference_steps=self.num_inference_steps,
+            tiled=False,
+            action=data.get("action"),
+            progress_bar_cmd=lambda x: x,
+            output_type="quantized",
+        )
+        if len(x_pred) > 0 and x_pred[0].size != x_gt[0].size:
+            x_gt = resize_pil_video(x_gt, x_pred[0].size[0], x_pred[0].size[1])
+        x_reconst = self._reconstruct_video(pipe, x_gt)
+
+        if sample_id < self.num_videos_to_log:
+            sample_dir = os.path.join(self.output_path, "eval_videos", f"step-{step}", f"sample_{sample_id}")
+            paths = {
+                f"eval_vis/sample_{sample_id}/x_gt": os.path.join(sample_dir, "x_gt.mp4"),
+                f"eval_vis/sample_{sample_id}/x_pred": os.path.join(sample_dir, "x_pred.mp4"),
+                f"eval_vis/sample_{sample_id}/x_reconst": os.path.join(sample_dir, "x_reconst.mp4"),
+            }
+            save_pil_video(x_gt, paths[f"eval_vis/sample_{sample_id}/x_gt"], fps=self.video_fps)
+            save_pil_video(x_pred, paths[f"eval_vis/sample_{sample_id}/x_pred"], fps=self.video_fps)
+            save_pil_video(x_reconst, paths[f"eval_vis/sample_{sample_id}/x_reconst"], fps=self.video_fps)
+            video_paths.update(paths)
+
+        metric_frame_count = min(len(x_pred), len(x_gt))
+        if metric_frame_count <= 1:
+            raise ValueError(
+                f"Eval sample {sample_id} has too few aligned frames: "
+                f"len(x_pred)={len(x_pred)}, len(x_gt)={len(x_gt)}."
+            )
+        pred_metrics = x_pred[1:metric_frame_count]
+        gt_metrics = x_gt[1:metric_frame_count]
+        pred_tensor = pil_video_to_tensor(pred_metrics)
+        gt_tensor = pil_video_to_tensor(gt_metrics)
+        return pred_metrics, gt_metrics, pred_tensor, gt_tensor
+
+    def _compute_metrics(self, pred_frames, gt_frames, pred_tensors, gt_tensors, device):
+        self._ensure_metrics(device)
+        pred = torch.cat(pred_tensors, dim=0).to(device=device)
+        gt = torch.cat(gt_tensors, dim=0).to(device=device)
+
+        mse = F.mse_loss(pred, gt).item()
+        psnr = 10.0 * math.log10(1.0 / max(mse, 1e-12))
+        ssim = float(ssim_torch(pred, gt).detach().cpu().item())
+
+        lpips_scores = []
+        for pred_frame, gt_frame in zip(pred_frames, gt_frames):
+            lpips_scores.append(self.lpips_metric.compute(pred_frame, gt_frame))
+        lpips = float(sum(lpips_scores) / max(len(lpips_scores), 1))
+        fid = self.fid_metric.compute(gt_frames, pred_frames, batch_size=self.metric_batch_size)
+
+        return {
+            "eval/mse": mse,
+            "eval/psnr": psnr,
+            "eval/ssim": ssim,
+            "eval/lpips": lpips,
+            "eval/fid": fid,
+        }
+
+    def __call__(self, accelerator, model, model_logger):
+        training_module = accelerator.unwrap_model(model)
+        module_modes = [(module, module.training) for module in training_module.modules()]
+        pipe = training_module.pipe
+        training_units = pipe.units
+        step = model_logger.num_steps
+
+        pred_frames = []
+        gt_frames = []
+        pred_tensors = []
+        gt_tensors = []
+        video_paths = {}
+
+        try:
+            pipe.units = getattr(training_module, "inference_units", pipe.units)
+            training_module.eval()
+            with torch.no_grad():
+                for sample_id, data in enumerate(self.dataloader):
+                    pred_metric_frames, gt_metric_frames, pred_tensor, gt_tensor = self._evaluate_sample(
+                        pipe,
+                        data,
+                        sample_id,
+                        step,
+                        video_paths,
+                    )
+                    pred_frames.extend(pred_metric_frames)
+                    gt_frames.extend(gt_metric_frames)
+                    pred_tensors.append(pred_tensor)
+                    gt_tensors.append(gt_tensor)
+
+                metrics = self._compute_metrics(
+                    pred_frames,
+                    gt_frames,
+                    pred_tensors,
+                    gt_tensors,
+                    device=pipe.device,
+                )
+                print(f"[Eval step {step}] " + ", ".join(f"{key}={value:.6f}" for key, value in metrics.items()))
+                model_logger.log_metrics(metrics, step=step)
+                model_logger.log_videos(video_paths, step=step)
+        finally:
+            pipe.units = training_units
+            for module, training in module_modes:
+                module.train(training)
+            pipe.scheduler.set_timesteps(1000, training=True)
+            pipe.load_models_to_device([])
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 class WanWorldModelTrainingModule(DiffusionTrainingModule):
@@ -229,6 +513,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             action_metadata_key=action_metadata_key,
             action_normalization_eps=action_normalization_eps,
         )
+        self.inference_units = list(self.pipe.units)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
 
@@ -322,6 +607,19 @@ def wan_world_model_parser():
     parser.add_argument("--world_model_include_depth", default=False, action="store_true", help="Load depth arrays from WorldModelDataset.")
     parser.add_argument("--world_model_include_camera_params", default=False, action="store_true", help="Load camera intrinsics/extrinsics from WorldModelDataset.")
     parser.add_argument("--world_model_include_failed", default=False, action="store_true", help="Include failed episodes from WorldModelDataset.")
+    parser.add_argument(
+        "--eval_dataset_base_path",
+        type=str,
+        default="world_model_data/robotwin_aloha_testset/custom_aloha_clean",
+        help="Eval dataset root. Uses the same WorldModelDataset config as training and train-set action metadata.",
+    )
+    parser.add_argument("--eval_steps", type=int, default=2000, help="Run periodic eval every N training steps. Set <= 0 to disable.")
+    parser.add_argument("--eval_num_inference_steps", type=int, default=50, help="Diffusion inference steps used during eval.")
+    parser.add_argument("--eval_max_samples", type=int, default=2, help="Maximum eval windows to run. Defaults to all eval windows.")
+    parser.add_argument("--eval_dataset_num_workers", type=int, default=0, help="Number of workers for eval data loading.")
+    parser.add_argument("--eval_num_videos_to_log", type=int, default=4, help="Number of eval samples whose videos are logged.")
+    parser.add_argument("--eval_video_fps", type=int, default=4, help="FPS for logged eval videos.")
+    parser.add_argument("--eval_metric_batch_size", type=int, default=4, help="Batch size for LPIPS/FID metric models.")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--action_dim", type=int, default=14, help="Robot action vector dimension. Enable action conditioning when set.")
     parser.add_argument(
@@ -354,6 +652,15 @@ if __name__ == "__main__":
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
     dataset = build_dataset(args)
+    eval_dataset = None
+    if args.eval_steps > 0 and not args.task.endswith(":data_process"):
+        eval_dataset = build_eval_dataset(args)
+    if eval_dataset is not None and len(eval_dataset) == 0:
+        warnings.warn("Eval dataset is empty, skip periodic eval.")
+        eval_dataset = None
+    if eval_dataset is not None and args.enable_model_cpu_offload:
+        raise ValueError("Periodic eval is not supported with --enable_model_cpu_offload. Disable eval or model CPU offload.")
+
     action_enabled = args.action_dim is not None and normalize_action_injection_method(args.action_injection_method) != "none"
     action_metadata_path = None
     if action_enabled:
@@ -393,6 +700,18 @@ if __name__ == "__main__":
         enable_wandb_log=args.enable_wandb_log,
         wandb_project=args.wandb_project,
     )
+    eval_callback = None
+    if eval_dataset is not None:
+        eval_callback = WanWorldModelEvalCallback(
+            dataset=eval_dataset,
+            eval_steps=args.eval_steps,
+            num_inference_steps=args.eval_num_inference_steps,
+            num_workers=args.eval_dataset_num_workers,
+            num_videos_to_log=args.eval_num_videos_to_log,
+            video_fps=args.eval_video_fps,
+            metric_batch_size=args.eval_metric_batch_size,
+            output_path=args.output_path,
+        )
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
@@ -401,4 +720,4 @@ if __name__ == "__main__":
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args, eval_callback=eval_callback)
