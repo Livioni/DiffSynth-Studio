@@ -352,13 +352,13 @@ class WanWorldModelEvalCallback:
         if sample_id < self.num_videos_to_log:
             sample_dir = os.path.join(self.output_path, "eval_videos", f"step-{step}", f"sample_{sample_id}")
             paths = {
-                f"eval_vis/sample_{sample_id}/x_gt": os.path.join(sample_dir, "x_gt.mp4"),
-                f"eval_vis/sample_{sample_id}/x_pred": os.path.join(sample_dir, "x_pred.mp4"),
-                f"eval_vis/sample_{sample_id}/x_reconst": os.path.join(sample_dir, "x_reconst.mp4"),
+                f"val_vis/sample_{sample_id}/x_gt": os.path.join(sample_dir, "x_gt.mp4"),
+                f"val_vis/sample_{sample_id}/x_pred": os.path.join(sample_dir, "x_pred.mp4"),
+                f"val_vis/sample_{sample_id}/x_reconst": os.path.join(sample_dir, "x_reconst.mp4"),
             }
-            save_pil_video(x_gt, paths[f"eval_vis/sample_{sample_id}/x_gt"], fps=self.video_fps)
-            save_pil_video(x_pred, paths[f"eval_vis/sample_{sample_id}/x_pred"], fps=self.video_fps)
-            save_pil_video(x_reconst, paths[f"eval_vis/sample_{sample_id}/x_reconst"], fps=self.video_fps)
+            save_pil_video(x_gt, paths[f"val_vis/sample_{sample_id}/x_gt"], fps=self.video_fps)
+            save_pil_video(x_pred, paths[f"val_vis/sample_{sample_id}/x_pred"], fps=self.video_fps)
+            save_pil_video(x_reconst, paths[f"val_vis/sample_{sample_id}/x_reconst"], fps=self.video_fps)
             video_paths.update(paths)
 
         metric_frame_count = min(len(x_pred), len(x_gt))
@@ -389,11 +389,11 @@ class WanWorldModelEvalCallback:
         fid = self.fid_metric.compute(gt_frames, pred_frames, batch_size=self.metric_batch_size)
 
         return {
-            "eval/mse": mse,
-            "eval/psnr": psnr,
-            "eval/ssim": ssim,
-            "eval/lpips": lpips,
-            "eval/fid": fid,
+            "val/mse": mse,
+            "val/psnr": psnr,
+            "val/ssim": ssim,
+            "val/lpips": lpips,
+            "val/fid": fid,
         }
 
     def __call__(self, accelerator, model, model_logger):
@@ -435,7 +435,7 @@ class WanWorldModelEvalCallback:
                 )
                 print(f"[Eval step {step}] " + ", ".join(f"{key}={value:.6f}" for key, value in metrics.items()))
                 model_logger.log_metrics(metrics, step=step)
-                model_logger.log_videos(video_paths, step=step)
+                model_logger.log_videos(video_paths, step=step, fps=self.video_fps)
         finally:
             pipe.units = training_units
             for module, training in module_modes:
@@ -592,7 +592,9 @@ def wan_world_model_parser():
     parser = add_offload_training_config(parser)
     parser = add_logger_config(parser)
     parser = add_video_size_config(parser)
-    parser.set_defaults(data_file_keys="video", extra_inputs="input_image")
+    parser.set_defaults(data_file_keys="video", extra_inputs="input_image", enable_tensorboard_log=True)
+    parser.add_argument("--disable_tensorboard_log", dest="enable_tensorboard_log", default=True, action="store_false", help="Disable tensorboard logging.")
+    parser.add_argument("--log_steps", type=int, default=10, help="Log train scalar metrics every N training steps. Set <= 0 to log every step.")
     parser.add_argument(
         "--dataset_type",
         type=str,

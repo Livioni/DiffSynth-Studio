@@ -6,10 +6,31 @@ class TensorBoardLogger:
     def __init__(self, log_dir):
         from torch.utils.tensorboard import SummaryWriter
         self.writer = SummaryWriter(log_dir=log_dir)
+        self.video_warning_printed = False
         print(f"TensorBoard is enabled. Run `tensorboard --logdir={log_dir}` to visualize the training progress.")
 
     def log(self, key, value, step):
         self.writer.add_scalar(key, value, step)
+
+    def log_video(self, key, path, step, fps=4):
+        try:
+            import imageio.v2 as imageio
+            import numpy as np
+
+            reader = imageio.get_reader(path)
+            try:
+                frames = [frame for frame in reader]
+            finally:
+                reader.close()
+            if len(frames) == 0:
+                return
+            video = torch.from_numpy(np.stack(frames, axis=0)).permute(0, 3, 1, 2).unsqueeze(0)
+            video = video.to(dtype=torch.float32) / 255.0
+            self.writer.add_video(key, video, step, fps=fps)
+        except Exception as error:
+            if not self.video_warning_printed:
+                print(f"Warning: TensorBoard video logging failed, skip videos. Error: {error}")
+                self.video_warning_printed = True
 
     def close(self):
         if self.writer is not None:
@@ -42,8 +63,8 @@ class WandbLogger:
     def log(self, key, value, step):
         self.wandb.log({key: value}, step=step)
 
-    def log_video(self, key, path, step):
-        self.wandb.log({key: self.wandb.Video(path, format="mp4")}, step=step)
+    def log_video(self, key, path, step, fps=4):
+        self.wandb.log({key: self.wandb.Video(path, format="mp4", fps=fps)}, step=step)
 
     def close(self):
         self.wandb.finish()
@@ -91,22 +112,29 @@ class ModelLogger:
             for logger in self.loggers:
                 logger.log(key, value, step)
 
-    def log_videos(self, videos, step=None):
+    def log_videos(self, videos, step=None, fps=4):
         self.ensure_loggers_initialized()
         step = self.num_steps if step is None else step
         for key, path in videos.items():
             for logger in self.loggers:
                 if hasattr(logger, "log_video"):
-                    logger.log_video(key, path, step)
+                    logger.log_video(key, path, step, fps=fps)
 
-    def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, **kwargs):
+    def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, log_steps=1, **kwargs):
         self.num_steps += 1
         if accelerator.is_main_process:
             self.ensure_loggers_initialized()
-            loss = kwargs.get("loss")
-            if loss is not None:
-                for logger in self.loggers:
-                    logger.log("loss", loss, self.num_steps)
+            should_log = log_steps is None or log_steps <= 0 or self.num_steps % log_steps == 0
+            if should_log:
+                metrics = {}
+                loss = kwargs.get("loss")
+                if loss is not None:
+                    metrics["train/loss"] = loss
+                learning_rate = kwargs.get("learning_rate")
+                if learning_rate is not None:
+                    metrics["train/learning_rate"] = learning_rate
+                if metrics:
+                    self.log_metrics(metrics, step=self.num_steps)
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 

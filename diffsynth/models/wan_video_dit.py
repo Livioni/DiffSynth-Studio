@@ -241,6 +241,10 @@ class ActionCrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
         self.attn = AttentionModule(self.num_heads)
+        nn.init.xavier_uniform_(self.q.weight)
+        nn.init.xavier_uniform_(self.k.weight)
+        nn.init.xavier_uniform_(self.v.weight)
+        nn.init.constant_(self.o.weight, 0)
 
     def forward(self, x: torch.Tensor, action: torch.Tensor):
         q = self.norm_q(self.q(x))

@@ -25,6 +25,7 @@ def launch_training_task(
     weight_decay: float = 1e-2,
     num_workers: int = 1,
     save_steps: int = None,
+    log_steps: int = 1,
     num_epochs: int = 1,
     enable_model_cpu_offload: bool = False,
     enable_optimizer_cpu_offload: bool = False,
@@ -39,6 +40,7 @@ def launch_training_task(
         weight_decay = args.weight_decay
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
+        log_steps = getattr(args, "log_steps", log_steps)
         num_epochs = args.num_epochs
         enable_model_cpu_offload = args.enable_model_cpu_offload
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
@@ -72,7 +74,8 @@ def launch_training_task(
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                learning_rate = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else optimizer.param_groups[0]["lr"]
+                model_logger.on_step_end(accelerator, model, save_steps, log_steps=log_steps, loss=loss, learning_rate=learning_rate)
                 if eval_callback is not None and eval_callback.should_run(model_logger.num_steps):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:

@@ -30,6 +30,10 @@ class WanWorldModelActionEmbedder(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(hidden_dim, embed_dim, bias=True),
         )
+        for module in self.mlp:
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                torch.nn.init.constant_(module.bias, 0)
         torch.nn.init.zeros_(self.mlp[-1].weight)
         torch.nn.init.zeros_(self.mlp[-1].bias)
 
