@@ -107,6 +107,32 @@ def set_to_torch_norm(models):
                 module.use_torch_norm = True
 
 
+def normalize_action_injection_method(method: Optional[str] = None):
+    if method is None:
+        return "none"
+    method = method.lower().replace("-", "_")
+    aliases = {
+        "": "none",
+        "off": "none",
+        "disable": "none",
+        "disabled": "none",
+        "add": "additive",
+        "cross": "cross_attention",
+        "crossattn": "cross_attention",
+        "cross_attn": "cross_attention",
+        "ada_ln": "adaln",
+        "ada_layer_norm": "adaln",
+    }
+    method = aliases.get(method, method)
+    if method not in ("none", "context", "additive", "cross_attention", "adaln"):
+        raise ValueError(
+            "`action_injection_method` must be one of "
+            "`none`, `context`, `additive`, `cross_attention`, or `adaln`, "
+            f"got `{method}`."
+        )
+    return method
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -201,6 +227,29 @@ class CrossAttention(nn.Module):
         return self.o(x)
 
 
+class ActionCrossAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.k = nn.Linear(dim, dim, bias=False)
+        self.v = nn.Linear(dim, dim, bias=False)
+        self.o = nn.Linear(dim, dim, bias=False)
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        self.attn = AttentionModule(self.num_heads)
+
+    def forward(self, x: torch.Tensor, action: torch.Tensor):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(action))
+        v = self.v(action)
+        x = self.attn(q, k, v)
+        return self.o(x)
+
+
 class GateModule(nn.Module):
     def __init__(self,):
         super().__init__()
@@ -214,6 +263,7 @@ class DiTBlock(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
+        self.eps = eps
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
@@ -225,13 +275,51 @@ class DiTBlock(nn.Module):
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
+        self.action_injection_method = "none"
 
-    def forward(self, x, context, t_mod, freqs):
+    def configure_action_injection(self, method: Optional[str] = None):
+        method = normalize_action_injection_method(method)
+        self.action_injection_method = method
+        if method == "cross_attention" and not hasattr(self, "action_cross_attn"):
+            self.action_norm = nn.LayerNorm(self.dim, eps=self.eps, elementwise_affine=False)
+            self.action_cross_attn = ActionCrossAttention(self.dim, self.num_heads, self.eps)
+            self.action_cross_attn.to(dtype=self.modulation.dtype, device=self.modulation.device)
+
+    def _validate_token_action(self, action_emb, x, expected_dim):
+        if action_emb.shape[1] != x.shape[1]:
+            raise ValueError(
+                f"Action token length {action_emb.shape[1]} does not match latent token length {x.shape[1]}."
+            )
+        if action_emb.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Action embedding dim {action_emb.shape[-1]} does not match expected dim {expected_dim}."
+            )
+
+    def forward(self, x, context, t_mod, freqs, action_emb=None):
+        method = getattr(self, "action_injection_method", "none")
+        if method in ("none", "context"):
+            action_emb = None
+        elif action_emb is not None:
+            action_emb = action_emb.to(dtype=x.dtype, device=x.device)
+
+        if action_emb is not None and method == "additive":
+            self._validate_token_action(action_emb, x, self.dim)
+            x = x + action_emb
+
         has_seq = len(t_mod.shape) == 4
+        modulation = self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+        if action_emb is not None and method == "adaln":
+            self._validate_token_action(action_emb, x, self.dim * 6)
+            action_mod = action_emb.unflatten(-1, (6, self.dim)).to(dtype=modulation.dtype, device=modulation.device)
+            if has_seq:
+                modulation = modulation + action_mod
+            else:
+                modulation = modulation.unsqueeze(1) + action_mod
+                has_seq = True
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
+            modulation).chunk(6, dim=chunk_dim)
         if has_seq:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
@@ -240,6 +328,14 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
         x = x + self.cross_attn(self.norm3(x), context)
+        if action_emb is not None and method == "cross_attention":
+            if action_emb.shape[-1] != self.dim:
+                raise ValueError(
+                    f"Action embedding dim {action_emb.shape[-1]} does not match expected dim {self.dim}."
+                )
+            if not hasattr(self, "action_cross_attn"):
+                self.configure_action_injection(method)
+            x = x + self.action_cross_attn(self.action_norm(x), action_emb)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -371,6 +467,7 @@ class WanModel(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
+        self.text_dim = text_dim
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
         self.patch_size = patch_size
@@ -397,6 +494,7 @@ class WanModel(torch.nn.Module):
             DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
             for _ in range(num_layers)
         ])
+        self.action_injection_method = "none"
         self.head = Head(dim, out_dim, patch_size, eps)
         head_dim = dim // num_heads
 
@@ -420,6 +518,23 @@ class WanModel(torch.nn.Module):
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
                                 wantodance_enable_global, wantodance_enable_dynamicfps, wantodance_enable_unimodel)
+
+    def action_embedding_dim(self, method: Optional[str] = None):
+        method = normalize_action_injection_method(method or self.action_injection_method)
+        if method == "context":
+            return self.text_dim
+        if method in ("additive", "cross_attention"):
+            return self.dim
+        if method == "adaln":
+            return self.dim * 6
+        return None
+
+    def configure_action_injection(self, method: Optional[str] = None):
+        method = normalize_action_injection_method(method)
+        self.action_injection_method = method
+        block_method = "none" if method == "context" else method
+        for block in self.blocks:
+            block.configure_action_injection(block_method)
 
     def prepare_wantodance(
         self,

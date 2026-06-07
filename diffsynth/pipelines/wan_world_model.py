@@ -1,3 +1,6 @@
+import json
+import os
+
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -8,16 +11,46 @@ from ..core import ModelConfig
 from ..core.device.npu_compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
-from ..models.wan_video_dit import WanModel
+from ..models.wan_video_dit import WanModel, normalize_action_injection_method
 from ..models.wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
 from ..models.wan_video_vae import WanVideoVAE
 from .wan_video import model_fn_wan_video
 
 
+class WanWorldModelActionEmbedder(torch.nn.Module):
+    """
+    Embed per-frame robot actions into the conditioning space required by the selected injection method.
+    """
+
+    def __init__(self, action_dim: int, embed_dim: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or embed_dim
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(action_dim, hidden_dim, bias=True),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_dim, embed_dim, bias=True),
+        )
+        torch.nn.init.zeros_(self.mlp[-1].weight)
+        torch.nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, action: torch.Tensor):
+        return self.mlp(action)
+
+
 class WanWorldModelPipeline(BasePipeline):
     model_id = "Wan-AI/Wan2.2-TI2V-5B"
 
-    def __init__(self, device=get_device_type(), torch_dtype=torch.bfloat16):
+    def __init__(
+        self,
+        device=get_device_type(),
+        torch_dtype=torch.bfloat16,
+        action_dim: int = None,
+        action_embedder_hidden_dim: int = None,
+        action_injection_method: str = "context",
+        action_metadata_path: str = None,
+        action_metadata_key: str = "robot_statistics",
+        action_normalization_eps: float = 1e-6,
+    ):
         super().__init__(
             device=device,
             torch_dtype=torch_dtype,
@@ -31,6 +64,17 @@ class WanWorldModelPipeline(BasePipeline):
         self.text_encoder: WanTextEncoder = None
         self.dit: WanModel = None
         self.vae: WanVideoVAE = None
+        self.action_dim = action_dim
+        self.action_embedder_hidden_dim = action_embedder_hidden_dim
+        self.action_injection_method = normalize_action_injection_method(action_injection_method)
+        self.action_metadata_path = action_metadata_path
+        self.action_metadata_key = action_metadata_key
+        self.action_normalization_eps = action_normalization_eps
+        self.action_normalization_stats = self._load_action_normalization_stats(
+            action_metadata_path,
+            metadata_key=action_metadata_key,
+        )
+        self.action_embedder: WanWorldModelActionEmbedder = None
         self.in_iteration_models = ("dit",)
         # 这里只保留 Wan2.2-TI2V-5B 推理必需的前处理单元，不接入音频或其它控制分支。
         self.units = [
@@ -38,10 +82,78 @@ class WanWorldModelPipeline(BasePipeline):
             WanWorldModelUnit_NoiseInitializer(),
             WanWorldModelUnit_InputVideoEmbedder(),
             WanWorldModelUnit_PromptEmbedder(),
+            WanWorldModelUnit_ActionEmbedder(),
             WanWorldModelUnit_InputImageEmbedderFused(),
         ]
         self.model_fn = model_fn_wan_video
         self.compilable_models = ["dit"]
+
+    @staticmethod
+    def _load_action_normalization_stats(metadata_path: str = None, metadata_key: str = "robot_statistics"):
+        if metadata_path is None:
+            return None
+        if not os.path.isfile(metadata_path):
+            raise FileNotFoundError(f"Action metadata file does not exist: {metadata_path}")
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Action metadata must be a JSON object: {metadata_path}")
+        if metadata_key in metadata:
+            metadata = metadata[metadata_key]
+        elif "arms" not in metadata:
+            raise KeyError(f"Action metadata `{metadata_path}` does not contain `{metadata_key}` or `arms`.")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Action metadata `{metadata_key}` must be a JSON object: {metadata_path}")
+
+        arms = metadata.get("arms", {})
+        mean = []
+        std = []
+        for arm in ("left", "right"):
+            try:
+                action_stats = arms[arm]["action"]
+            except KeyError as error:
+                raise KeyError(f"Action metadata is missing `{arm}.action` statistics.") from error
+            mean.extend(action_stats["mean"])
+            std.extend(action_stats["std"])
+
+        if len(mean) != len(std):
+            raise ValueError(f"Action metadata mean/std dimensions do not match: {len(mean)} vs {len(std)}.")
+        return {
+            "path": metadata_path,
+            "order": ("left.action", "right.action"),
+            "mean": tuple(float(value) for value in mean),
+            "std": tuple(float(value) for value in std),
+        }
+
+    def build_action_embedder(self, action_dim: int = None, hidden_dim: int = None, action_injection_method: str = None):
+        self.action_dim = action_dim
+        if action_injection_method is not None:
+            self.action_injection_method = normalize_action_injection_method(action_injection_method)
+        if action_dim is None:
+            self.action_embedder_hidden_dim = hidden_dim
+            self.action_embedder = None
+            return
+        if self.action_normalization_stats is not None and len(self.action_normalization_stats["mean"]) != action_dim:
+            raise ValueError(
+                f"Action metadata dimension is {len(self.action_normalization_stats['mean'])}, "
+                f"but pipeline action_dim is {action_dim}."
+            )
+        if self.dit is None:
+            raise ValueError("DiT must be loaded before building the action embedder.")
+        self.dit.configure_action_injection(self.action_injection_method)
+        embed_dim = self.dit.action_embedding_dim(self.action_injection_method)
+        if embed_dim is None:
+            self.action_embedder_hidden_dim = hidden_dim
+            self.action_embedder = None
+            return
+        hidden_dim = hidden_dim or self.dit.dim
+        self.action_embedder_hidden_dim = hidden_dim
+        self.action_embedder = WanWorldModelActionEmbedder(
+            action_dim=action_dim,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+        )
 
     @classmethod
     def default_model_configs(cls, **kwargs) -> list[ModelConfig]:
@@ -60,6 +172,12 @@ class WanWorldModelPipeline(BasePipeline):
         tokenizer_config: ModelConfig = None,
         redirect_common_files: bool = True,
         vram_limit: float = None,
+        action_dim: int = None,
+        action_embedder_hidden_dim: int = None,
+        action_injection_method: str = "context",
+        action_metadata_path: str = None,
+        action_metadata_key: str = "robot_statistics",
+        action_normalization_eps: float = 1e-6,
     ):
         if model_configs is None:
             model_configs = cls.default_model_configs()
@@ -80,13 +198,27 @@ class WanWorldModelPipeline(BasePipeline):
                     model_config.model_id = redirect_dict[model_config.origin_file_pattern][0]
                     model_config.origin_file_pattern = redirect_dict[model_config.origin_file_pattern][1]
 
-        pipe = cls(device=device, torch_dtype=torch_dtype)
+        pipe = cls(
+            device=device,
+            torch_dtype=torch_dtype,
+            action_dim=action_dim,
+            action_embedder_hidden_dim=action_embedder_hidden_dim,
+            action_injection_method=action_injection_method,
+            action_metadata_path=action_metadata_path,
+            action_metadata_key=action_metadata_key,
+            action_normalization_eps=action_normalization_eps,
+        )
         model_pool = pipe.download_and_load_models(model_configs, vram_limit)
 
         # Wan World Model 只需要文本编码器、DiT 和 VAE；audio 相关模型与 processor 不加载。
         pipe.text_encoder = model_pool.fetch_model("wan_video_text_encoder")
         pipe.dit = model_pool.fetch_model("wan_video_dit")
         pipe.vae = model_pool.fetch_model("wan_video_vae")
+        pipe.build_action_embedder(
+            action_dim=action_dim,
+            hidden_dim=action_embedder_hidden_dim,
+            action_injection_method=action_injection_method,
+        )
 
         if pipe.vae is not None:
             pipe.height_division_factor = pipe.vae.upsampling_factor * 2
@@ -116,6 +248,7 @@ class WanWorldModelPipeline(BasePipeline):
         tiled: bool = True,
         tile_size: tuple[int, int] = (30, 52),
         tile_stride: tuple[int, int] = (15, 26),
+        action: Union[torch.Tensor, list, tuple, dict] = None,
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
     ):
@@ -134,6 +267,7 @@ class WanWorldModelPipeline(BasePipeline):
             "tiled": tiled,
             "tile_size": tile_size,
             "tile_stride": tile_stride,
+            "action": action,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -240,6 +374,125 @@ class WanWorldModelUnit_PromptEmbedder(PipelineUnit):
         for seq_len in seq_lens:
             prompt_emb[:, seq_len:] = 0
         return {"context": prompt_emb}
+
+
+class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            seperate_cfg=True,
+            input_params=("action",),
+            input_params_posi={"context": "context"},
+            input_params_nega={"context": "context"},
+            output_params=("context", "action_emb"),
+            onload_model_names=("action_embedder",),
+        )
+
+    @staticmethod
+    def _flatten_robot_action(robot):
+        pieces = []
+        for arm in ("left", "right"):
+            arm_action = robot.get(arm, {}).get("action", {})
+            for key in ("arm_joint", "gripper"):
+                value = arm_action.get(key)
+                if value is None:
+                    continue
+                value = torch.as_tensor(value)
+                if value.ndim == 1:
+                    value = value.unsqueeze(-1)
+                pieces.append(value)
+        if len(pieces) == 0:
+            raise ValueError("Robot action dict does not contain any action tensors.")
+        return torch.cat(pieces, dim=-1)
+
+    @classmethod
+    def _prepare_action(cls, action):
+        if isinstance(action, dict):
+            action = cls._flatten_robot_action(action)
+        elif not torch.is_tensor(action):
+            action = torch.as_tensor(action)
+
+        if action.ndim == 1:
+            action = action.reshape(1, -1, 1)
+        elif action.ndim == 2:
+            action = action.unsqueeze(0)
+        elif action.ndim != 3:
+            raise ValueError(f"`action` must have shape [T, D] or [B, T, D], got {tuple(action.shape)}.")
+        return action
+
+    @staticmethod
+    def _normalize_action(pipe: WanWorldModelPipeline, action: torch.Tensor):
+        stats = getattr(pipe, "action_normalization_stats", None)
+        if stats is None:
+            return action
+        if action.shape[-1] != len(stats["mean"]):
+            raise ValueError(
+                f"Action metadata dimension is {len(stats['mean'])}, but `action` last dimension is {action.shape[-1]}."
+            )
+
+        normalize_dtype = (
+            action.dtype
+            if torch.is_floating_point(action) and action.dtype not in (torch.float16, torch.bfloat16)
+            else torch.float32
+        )
+        action = action.to(dtype=normalize_dtype)
+        mean = torch.as_tensor(stats["mean"], dtype=normalize_dtype, device=action.device).view(1, 1, -1)
+        std = torch.as_tensor(stats["std"], dtype=normalize_dtype, device=action.device).view(1, 1, -1)
+        eps = float(getattr(pipe, "action_normalization_eps", 1e-6))
+        std = torch.clamp(std, min=eps)
+        return (action - mean) / std
+
+    def process(self, pipe: WanWorldModelPipeline, action, context) -> dict:
+        if action is None:
+            return {}
+        injection_method = normalize_action_injection_method(pipe.action_injection_method)
+        if injection_method == "none":
+            return {}
+        if pipe.action_embedder is None:
+            raise ValueError("Action conditioning requires `action_dim` when building WanWorldModelPipeline.")
+
+        action = self._prepare_action(action).to(device=pipe.device)
+        if action.shape[-1] != pipe.action_dim:
+            raise ValueError(f"`action` last dimension is {action.shape[-1]}, but pipeline action_dim is {pipe.action_dim}.")
+        action = self._normalize_action(pipe, action).to(dtype=pipe.torch_dtype)
+
+        pipe.action_embedder.to(dtype=pipe.torch_dtype, device=pipe.device)
+        action_emb = pipe.action_embedder(action)
+        action_emb = torch.cat(
+            [
+                torch.zeros_like(action_emb[:, :1]),
+                action_emb[:, :-1],
+            ],
+            dim=1,
+        ) #第一帧没有到这张图的action
+
+        if action_emb.shape[0] != context.shape[0]:
+            if action_emb.shape[0] == 1:
+                action_emb = action_emb.expand(context.shape[0], -1, -1)
+            elif context.shape[0] == 1:
+                context = context.expand(action_emb.shape[0], -1, -1)
+            else:
+                raise ValueError(
+                    f"Action batch size {action_emb.shape[0]} does not match context batch size {context.shape[0]}."
+                )
+
+        if injection_method != "context":
+            return {
+                "context": context,
+                "action_emb": action_emb,
+            }
+
+        context = context.clone()
+        action_emb = action_emb.to(dtype=context.dtype, device=context.device)
+        context_length = context.shape[1]
+        for batch_id in range(context.shape[0]):
+            prompt_length = int(torch.any(context[batch_id] != 0, dim=-1).sum().item())
+            start = prompt_length if prompt_length < context_length else max(0, context_length - action_emb.shape[1])
+            token_count = min(action_emb.shape[1], context_length - start)
+            if token_count > 0:
+                context[batch_id, start:start + token_count] = (
+                    context[batch_id, start:start + token_count] + action_emb[batch_id, :token_count]
+                )
+        return {"context": context}
 
 
 class WanWorldModelUnit_InputImageEmbedderFused(PipelineUnit):

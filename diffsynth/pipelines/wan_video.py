@@ -16,7 +16,7 @@ from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig, gradient_checkpoint_forward
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
-from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
+from ..models.wan_video_dit import WanModel, normalize_action_injection_method, sinusoidal_embedding_1d
 from ..models.wan_video_dit_s2v import rope_precompute
 from ..models.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 from ..models.wan_video_vae import WanVideoVAE
@@ -1273,6 +1273,55 @@ def wantodance_get_single_freqs(freqs, frame_num, fps):
     return freqs_new
 
 
+def prepare_wan_action_condition(
+    dit: WanModel,
+    action_emb: torch.Tensor,
+    batch_size: int,
+    frame_count: int,
+    tokens_per_frame: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    prepend_token_count: int = 0,
+):
+    method = normalize_action_injection_method(getattr(dit, "action_injection_method", "none"))
+    if action_emb is None or method in ("none", "context"):
+        return None
+    if action_emb.ndim != 3:
+        raise ValueError(f"`action_emb` must have shape [B, T, C], got {tuple(action_emb.shape)}.")
+    if action_emb.shape[0] != batch_size:
+        if action_emb.shape[0] == 1:
+            action_emb = action_emb.expand(batch_size, -1, -1)
+        elif batch_size == 1:
+            batch_size = action_emb.shape[0]
+        else:
+            raise ValueError(
+                f"Action batch size {action_emb.shape[0]} does not match latent batch size {batch_size}."
+            )
+
+    action_emb = action_emb.to(dtype=dtype, device=device)
+    if action_emb.shape[1] != frame_count:
+        interp_dtype = action_emb.dtype
+        interp_mode = "linear" if action_emb.shape[1] > 1 and frame_count > 1 else "nearest"
+        action_emb = torch.nn.functional.interpolate(
+            action_emb.transpose(1, 2).float(),
+            size=frame_count,
+            mode=interp_mode,
+            align_corners=False if interp_mode == "linear" else None,
+        ).transpose(1, 2).to(dtype=interp_dtype)
+
+    if method == "cross_attention":
+        return action_emb
+
+    action_emb = action_emb.unsqueeze(2).expand(-1, -1, tokens_per_frame, -1)
+    action_emb = action_emb.reshape(batch_size, frame_count * tokens_per_frame, action_emb.shape[-1])
+    if prepend_token_count > 0:
+        action_emb = torch.cat(
+            [action_emb.new_zeros(batch_size, prepend_token_count, action_emb.shape[-1]), action_emb],
+            dim=1,
+        )
+    return action_emb
+
+
 def model_fn_wan_video(
     dit: WanModel,
     motion_controller: WanMotionControllerModel = None,
@@ -1282,6 +1331,7 @@ def model_fn_wan_video(
     latents: torch.Tensor = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
+    action_emb: Optional[torch.Tensor] = None,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     reference_latents = None,
@@ -1314,6 +1364,8 @@ def model_fn_wan_video(
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
+        if action_emb is not None:
+            raise NotImplementedError("Sliding-window Wan inference does not support `action_emb` yet.")
         model_kwargs = dict(
             dit=dit,
             motion_controller=motion_controller,
@@ -1321,6 +1373,7 @@ def model_fn_wan_video(
             latents=latents,
             timestep=timestep,
             context=context,
+            action_emb=action_emb,
             clip_feature=clip_feature,
             y=y,
             reference_latents=reference_latents,
@@ -1428,6 +1481,17 @@ def model_fn_wan_video(
         reference_latents = dit.ref_conv(reference_latents).flatten(2).transpose(1, 2)
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
+
+    action_cond = prepare_wan_action_condition(
+        dit=dit,
+        action_emb=action_emb,
+        batch_size=x.shape[0],
+        frame_count=f - (1 if reference_latents is not None else 0),
+        tokens_per_frame=h * w,
+        dtype=x.dtype,
+        device=x.device,
+        prepend_token_count=reference_latents.shape[1] if reference_latents is not None else 0,
+    )
     
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -1559,11 +1623,12 @@ def model_fn_wan_video(
                 else:
                     x, x_vap = vap(block, x, context, t_mod, freqs, x_vap, context_vap, t_mod_vap, freqs_vap, block_id)
             else:
+                block_inputs = (x, context, t_mod, freqs) if action_cond is None else (x, context, t_mod, freqs, action_cond)
                 x = gradient_checkpoint_forward(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    *block_inputs
                 )
               
             

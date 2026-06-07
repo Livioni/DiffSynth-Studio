@@ -17,6 +17,7 @@ class _EpisodeInfo:
     episode: str
     path: str
     meta: dict
+    text_conditions: tuple[str, ...]
     length: int
 
 
@@ -137,6 +138,58 @@ class WorldModelDataset(torch.utils.data.Dataset):
     def _prompt_from_task(task):
         return task.replace("_", " ")
 
+    @staticmethod
+    def _text_from_instruction_item(item):
+        if isinstance(item, str):
+            return item.strip()
+        if isinstance(item, dict):
+            for key in ("instruction", "text", "prompt", "caption"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    return value.strip()
+        return None
+
+    def _instruction_json_path(self, episode_path, episode):
+        candidate_paths = [
+            os.path.join(episode_path, f"{episode}.json"),
+            os.path.join(episode_path, "instruction.json"),
+            os.path.join(episode_path, "instructions.json"),
+        ]
+        for path in candidate_paths:
+            if os.path.isfile(path):
+                return path
+
+        for name in sorted(os.listdir(episode_path)):
+            if name.endswith(".json") and name != "meta.json":
+                return os.path.join(episode_path, name)
+        return None
+
+    def _load_text_conditions(self, episode_path, episode, task):
+        instruction_path = self._instruction_json_path(episode_path, episode)
+        if instruction_path is None:
+            return (self._prompt_from_task(task),)
+
+        instruction = self._load_json(instruction_path)
+        seen = instruction.get("seen", []) if isinstance(instruction, dict) else []
+        if isinstance(seen, str):
+            seen = seen.splitlines()
+
+        text_conditions = []
+        for item in seen:
+            text = self._text_from_instruction_item(item)
+            if text:
+                text_conditions.append(text)
+        if len(text_conditions) == 0:
+            text_conditions.append(self._prompt_from_task(task))
+        return tuple(text_conditions)
+
+    @staticmethod
+    def _sample_text_condition(text_conditions):
+        if len(text_conditions) == 1:
+            return text_conditions[0]
+        index = int(torch.randint(len(text_conditions), (1,)).item())
+        return text_conditions[index]
+
     def _list_task_names(self):
         if self.tasks is not None:
             missing = [task for task in self.tasks if not os.path.isdir(os.path.join(self.root, task))]
@@ -254,8 +307,9 @@ class WorldModelDataset(torch.utils.data.Dataset):
                 length = self._episode_length(episode_path)
                 if length is None or length < self.num_frames:
                     continue
+                text_conditions = self._load_text_conditions(episode_path, episode, task)
                 episode_id = len(self.episodes)
-                self.episodes.append(_EpisodeInfo(task, episode, episode_path, meta, length))
+                self.episodes.append(_EpisodeInfo(task, episode, episode_path, meta, text_conditions, length))
                 for start in range(0, length - self.num_frames + 1, self.stride):
                     self.windows.append(_WindowInfo(episode_id, start))
 
@@ -316,6 +370,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
         window = self.windows[index % len(self.windows)]
         episode = self.episodes[window.episode_id]
         frame_indices = torch.arange(window.start, window.start + self.num_frames, dtype=torch.long)
+        prompt = self._sample_text_condition(episode.text_conditions)
 
         cameras = {}
         for camera in self.cameras:
@@ -334,7 +389,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
             "task": episode.task,
             "episode": episode.episode,
             "episode_path": episode.path,
-            "prompt": self._prompt_from_task(episode.task),
+            "prompt": prompt,
             "frame_indices": frame_indices,
             "cameras": cameras,
             "robot": self._load_robot_window(episode.path, frame_indices),

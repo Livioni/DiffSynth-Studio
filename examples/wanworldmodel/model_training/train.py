@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import warnings
 
@@ -8,6 +9,7 @@ import torch
 from diffsynth.core import UnifiedDataset, WorldModelDataset
 from diffsynth.core.data.operators import ImageCropAndResize
 from diffsynth.diffusion import *
+from diffsynth.models.wan_video_dit import normalize_action_injection_method
 from diffsynth.pipelines.wan_world_model import ModelConfig, WanWorldModelPipeline
 
 
@@ -37,6 +39,22 @@ def contains_cached_data_files(path):
     return False
 
 
+def default_action_metadata_path(dataset_base_path, metadata_key="robot_statistics"):
+    if dataset_base_path is None:
+        return None
+    path = os.path.join(dataset_base_path, "metadata.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(metadata, dict) and (metadata_key in metadata or "arms" in metadata):
+        return path
+    return None
+
+
 class WorldModelTrainingDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, video_camera="head_camera", frame_processor=None):
         self.dataset = dataset
@@ -46,6 +64,22 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+    @staticmethod
+    def robot_action_to_tensor(robot):
+        pieces = []
+        for arm in ("left", "right"):
+            arm_action = robot.get(arm, {}).get("action", {})
+            for key in ("arm_joint", "gripper"):
+                value = arm_action.get(key)
+                if value is None:
+                    continue
+                if value.ndim == 1:
+                    value = value.unsqueeze(-1)
+                pieces.append(value)
+        if len(pieces) == 0:
+            return None
+        return torch.cat(pieces, dim=-1)
 
     def __getitem__(self, index):
         data = self.dataset[index]
@@ -59,6 +93,9 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             video = [self.frame_processor(frame) for frame in video]
         data["video"] = video
         data["input_image"] = video[0]
+        action = self.robot_action_to_tensor(data["robot"])
+        if action is not None:
+            data["action"] = action
         return data
 
 
@@ -143,11 +180,28 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        action_dim=None,
+        action_embedder_hidden_dim=None,
+        action_injection_method="context",
+        action_metadata_path=None,
+        action_metadata_key="robot_statistics",
+        action_normalization_eps=1e-6,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
             warnings.warn("Gradient checkpointing is disabled. The training framework will enable it to reduce OOM risk.")
             use_gradient_checkpointing = True
+
+        action_injection_method = normalize_action_injection_method(action_injection_method)
+        action_enabled = action_dim is not None and action_injection_method != "none"
+        if action_enabled:
+            if trainable_models is None:
+                trainable_models = "dit,action_embedder"
+            else:
+                trainable_model_names = [name.strip() for name in trainable_models.split(",") if name.strip()]
+                if "action_embedder" not in trainable_model_names:
+                    trainable_model_names.append("action_embedder")
+                    trainable_models = ",".join(trainable_model_names)
 
         model_configs = self.parse_model_configs(
             model_paths,
@@ -168,6 +222,12 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             device=device,
             model_configs=model_configs,
             tokenizer_config=tokenizer_config,
+            action_dim=action_dim,
+            action_embedder_hidden_dim=action_embedder_hidden_dim,
+            action_injection_method=action_injection_method,
+            action_metadata_path=action_metadata_path,
+            action_metadata_key=action_metadata_key,
+            action_normalization_eps=action_normalization_eps,
         )
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
@@ -181,6 +241,8 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.extra_inputs = [item.strip() for item in extra_inputs.split(",") if item.strip()] if extra_inputs is not None else []
+        if action_enabled and "action" not in self.extra_inputs:
+            self.extra_inputs.append("action")
         self.fp8_models = fp8_models
         self.task = task
         self.task_to_loss = {
@@ -199,6 +261,8 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             if extra_input == "input_image":
                 # Wan2.2-TI2V-5B 的 I2V 条件直接取训练视频首帧，不要求 metadata 单独提供 image。
                 inputs_shared["input_image"] = data["video"][0]
+            elif extra_input == "action" and "action" not in data and "robot" in data:
+                inputs_shared["action"] = WorldModelTrainingDataset.robot_action_to_tensor(data["robot"])
             else:
                 inputs_shared[extra_input] = data[extra_input]
         return inputs_shared
@@ -259,6 +323,23 @@ def wan_world_model_parser():
     parser.add_argument("--world_model_include_camera_params", default=False, action="store_true", help="Load camera intrinsics/extrinsics from WorldModelDataset.")
     parser.add_argument("--world_model_include_failed", default=False, action="store_true", help="Include failed episodes from WorldModelDataset.")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    parser.add_argument("--action_dim", type=int, default=14, help="Robot action vector dimension. Enable action conditioning when set.")
+    parser.add_argument(
+        "--action_metadata_path",
+        type=str,
+        default=None,
+        help="Path to robot action normalization metadata. Defaults to <dataset_base_path>/metadata.json when it contains robot_statistics.",
+    )
+    parser.add_argument("--action_metadata_key", type=str, default="robot_statistics", help="Top-level metadata key for robot statistics.")
+    parser.add_argument("--action_normalization_eps", type=float, default=1e-6, help="Minimum std value used for action normalization.")
+    parser.add_argument("--action_embedder_hidden_dim", type=int, default=None, help="Hidden dimension of the action embedder MLP. Defaults to Wan DiT hidden dimension.")
+    parser.add_argument(
+        "--action_injection_method",
+        type=str,
+        default="additive",
+        choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln"),
+        help="Action conditioning method: `context` keeps the previous context-token scheme; the others inject action in Wan DiT blocks.",
+    )
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Maximum timestep boundary ratio.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Minimum timestep boundary ratio.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
@@ -273,6 +354,13 @@ if __name__ == "__main__":
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
     dataset = build_dataset(args)
+    action_enabled = args.action_dim is not None and normalize_action_injection_method(args.action_injection_method) != "none"
+    action_metadata_path = None
+    if action_enabled:
+        action_metadata_path = args.action_metadata_path or default_action_metadata_path(
+            args.dataset_base_path,
+            metadata_key=args.action_metadata_key,
+        )
     model = WanWorldModelTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -289,6 +377,12 @@ if __name__ == "__main__":
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        action_dim=args.action_dim,
+        action_embedder_hidden_dim=args.action_embedder_hidden_dim,
+        action_injection_method=args.action_injection_method,
+        action_metadata_path=action_metadata_path,
+        action_metadata_key=args.action_metadata_key,
+        action_normalization_eps=args.action_normalization_eps,
     )
     model_logger = ModelLogger(
         args.output_path,
