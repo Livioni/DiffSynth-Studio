@@ -470,6 +470,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         action_metadata_path=None,
         action_metadata_key="robot_statistics",
         action_normalization_eps=1e-6,
+        action_normalization_mode="standard",
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -512,6 +513,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             action_metadata_path=action_metadata_path,
             action_metadata_key=action_metadata_key,
             action_normalization_eps=action_normalization_eps,
+            action_normalization_mode=action_normalization_mode,
         )
         self.inference_units = list(self.pipe.units)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)
@@ -632,6 +634,13 @@ def wan_world_model_parser():
     )
     parser.add_argument("--action_metadata_key", type=str, default="robot_statistics", help="Top-level metadata key for robot statistics.")
     parser.add_argument("--action_normalization_eps", type=float, default=1e-6, help="Minimum std value used for action normalization.")
+    parser.add_argument(
+        "--action_normalization_mode",
+        type=str,
+        default="standard",
+        choices=("standard", "scale_only", "scale-only"),
+        help="Action normalization mode. `standard` uses (action - mean) / std; `scale_only` uses action / std.",
+    )
     parser.add_argument("--action_embedder_hidden_dim", type=int, default=None, help="Hidden dimension of the action embedder MLP. Defaults to Wan DiT hidden dimension.")
     parser.add_argument(
         "--action_injection_method",
@@ -643,6 +652,25 @@ def wan_world_model_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Maximum timestep boundary ratio.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Minimum timestep boundary ratio.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument(
+        "--disable_training_checkpoint",
+        dest="save_training_checkpoint",
+        default=True,
+        action="store_false",
+        help="Disable full training-state checkpoints saved at --save_steps.",
+    )
+    parser.add_argument(
+        "--resume_training_checkpoint",
+        type=str,
+        default=None,
+        help="Resume optimizer, scheduler, RNG, model state, and global step from a training checkpoint directory. Use `latest` for the latest checkpoint under --training_checkpoint_dir.",
+    )
+    parser.add_argument(
+        "--training_checkpoint_dir",
+        type=str,
+        default=None,
+        help="Directory for full training-state checkpoints. Defaults to <output_path>/training_checkpoints.",
+    )
     return parser
 
 
@@ -670,6 +698,15 @@ if __name__ == "__main__":
             args.dataset_base_path,
             metadata_key=args.action_metadata_key,
         )
+    resume_model_checkpoint = args.resume_from_checkpoint
+    if args.resume_training_checkpoint is not None:
+        if resume_model_checkpoint is not None:
+            warnings.warn(
+                "--resume_training_checkpoint restores model weights itself; "
+                "ignore --resume_from_checkpoint for the initial model-only load."
+            )
+        resume_model_checkpoint = None
+
     model = WanWorldModelTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -680,7 +717,7 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         fp8_models=args.fp8_models,
         offload_models=args.offload_models,
-        resume_from_checkpoint=args.resume_from_checkpoint,
+        resume_from_checkpoint=resume_model_checkpoint,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         task=args.task,
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
@@ -692,6 +729,7 @@ if __name__ == "__main__":
         action_metadata_path=action_metadata_path,
         action_metadata_key=args.action_metadata_key,
         action_normalization_eps=args.action_normalization_eps,
+        action_normalization_mode=args.action_normalization_mode,
     )
     model_logger = ModelLogger(
         args.output_path,

@@ -17,6 +17,14 @@ from ..models.wan_video_vae import WanVideoVAE
 from .wan_video import model_fn_wan_video
 
 
+def normalize_action_normalization_mode(mode: str = "standard"):
+    mode = "standard" if mode is None else str(mode).strip().lower().replace("-", "_")
+    supported_modes = ("standard", "scale_only")
+    if mode not in supported_modes:
+        raise ValueError(f"`action_normalization_mode` must be one of {supported_modes}, got {mode!r}.")
+    return mode
+
+
 class WanWorldModelActionEmbedder(torch.nn.Module):
     """
     Embed per-frame robot actions into the conditioning space required by the selected injection method.
@@ -54,6 +62,7 @@ class WanWorldModelPipeline(BasePipeline):
         action_metadata_path: str = None,
         action_metadata_key: str = "robot_statistics",
         action_normalization_eps: float = 1e-6,
+        action_normalization_mode: str = "standard",
     ):
         super().__init__(
             device=device,
@@ -74,6 +83,7 @@ class WanWorldModelPipeline(BasePipeline):
         self.action_metadata_path = action_metadata_path
         self.action_metadata_key = action_metadata_key
         self.action_normalization_eps = action_normalization_eps
+        self.action_normalization_mode = normalize_action_normalization_mode(action_normalization_mode)
         self.action_normalization_stats = self._load_action_normalization_stats(
             action_metadata_path,
             metadata_key=action_metadata_key,
@@ -138,9 +148,9 @@ class WanWorldModelPipeline(BasePipeline):
             self.action_embedder_hidden_dim = hidden_dim
             self.action_embedder = None
             return
-        if self.action_normalization_stats is not None and len(self.action_normalization_stats["mean"]) != action_dim:
+        if self.action_normalization_stats is not None and len(self.action_normalization_stats["std"]) != action_dim:
             raise ValueError(
-                f"Action metadata dimension is {len(self.action_normalization_stats['mean'])}, "
+                f"Action metadata dimension is {len(self.action_normalization_stats['std'])}, "
                 f"but pipeline action_dim is {action_dim}."
             )
         if self.dit is None:
@@ -182,6 +192,7 @@ class WanWorldModelPipeline(BasePipeline):
         action_metadata_path: str = None,
         action_metadata_key: str = "robot_statistics",
         action_normalization_eps: float = 1e-6,
+        action_normalization_mode: str = "standard",
     ):
         if model_configs is None:
             model_configs = cls.default_model_configs()
@@ -211,6 +222,7 @@ class WanWorldModelPipeline(BasePipeline):
             action_metadata_path=action_metadata_path,
             action_metadata_key=action_metadata_key,
             action_normalization_eps=action_normalization_eps,
+            action_normalization_mode=action_normalization_mode,
         )
         model_pool = pipe.download_and_load_models(model_configs, vram_limit)
 
@@ -428,9 +440,9 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
         stats = getattr(pipe, "action_normalization_stats", None)
         if stats is None:
             return action
-        if action.shape[-1] != len(stats["mean"]):
+        if action.shape[-1] != len(stats["std"]):
             raise ValueError(
-                f"Action metadata dimension is {len(stats['mean'])}, but `action` last dimension is {action.shape[-1]}."
+                f"Action metadata dimension is {len(stats['std'])}, but `action` last dimension is {action.shape[-1]}."
             )
 
         normalize_dtype = (
@@ -443,6 +455,9 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
         std = torch.as_tensor(stats["std"], dtype=normalize_dtype, device=action.device).view(1, 1, -1)
         eps = float(getattr(pipe, "action_normalization_eps", 1e-6))
         std = torch.clamp(std, min=eps)
+        mode = normalize_action_normalization_mode(getattr(pipe, "action_normalization_mode", "standard"))
+        if mode == "scale_only":
+            return action / std
         return (action - mean) / std
 
     def process(self, pipe: WanWorldModelPipeline, action, context) -> dict:
