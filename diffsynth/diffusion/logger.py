@@ -64,7 +64,9 @@ class WandbLogger:
         self.wandb.log({key: value}, step=step)
 
     def log_video(self, key, path, step, fps=4):
-        self.wandb.log({key: self.wandb.Video(path, format="mp4", fps=fps)}, step=step)
+        # The frame rate is encoded when the video file is saved. Passing fps
+        # alongside a file path is ignored by wandb and emits a warning.
+        self.wandb.log({key: self.wandb.Video(path, format="mp4")}, step=step)
 
     def close(self):
         self.wandb.finish()
