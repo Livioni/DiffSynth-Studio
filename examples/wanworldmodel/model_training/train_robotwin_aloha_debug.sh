@@ -73,7 +73,10 @@ enable_lora_hot_loading=false  # 是否启用 LoRA 热加载，仅部分 image-t
 # =========================
 task="sft"  # 训练任务类型，如 sft、sft:train、direct_distill。
 trainable_models="dit,action_embedder"  # 参与训练的模块名，逗号分隔。
-learning_rate=1e-5  # 学习率。
+learning_rate=1e-4  # 学习率。
+lr_scheduler="warmup_cosine"  # 学习率调度：constant 或 warmup_cosine。
+lr_warmup_steps=1000  # 线性 warmup step 数。
+lr_cosine_min_ratio=0.1  # cosine decay 最终学习率比例。
 weight_decay=0.01  # AdamW 权重衰减。
 num_epochs=1  # 训练 epoch 数。
 customized_optimizer=""  # 自定义 optimizer 类路径，如 bitsandbytes.optim.Adam8bit。
@@ -94,7 +97,7 @@ min_timestep_boundary=0.0  # 采样 timestep 下边界比例。
 # =========================
 action_dim=14  # 机器人 action 向量维度；设空会禁用 action 条件。
 action_embedder_hidden_dim=""  # action embedder 隐藏层维度；留空使用 DiT hidden dim。
-action_injection_method="additive"  # action 注入方式：none/context/additive/cross_attention/adaln。
+action_injection_method="additive"  # action 注入方式：none/context/additive/cross_attention/adaln/film。
 action_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # action 归一化统计 metadata 路径。
 action_metadata_key="robot_statistics"  # metadata 中 action 统计信息的 key。
 action_normalization_eps=1e-6  # action 归一化 std 的最小值。
@@ -211,6 +214,9 @@ add_flag --enable_lora_hot_loading "${enable_lora_hot_loading}"
 add_arg --task "${task}"
 add_optional_arg --trainable_models "${trainable_models}"
 add_arg --learning_rate "${learning_rate}"
+add_arg --lr_scheduler "${lr_scheduler}"
+add_arg --lr_warmup_steps "${lr_warmup_steps}"
+add_arg --lr_cosine_min_ratio "${lr_cosine_min_ratio}"
 add_arg --weight_decay "${weight_decay}"
 add_arg --num_epochs "${num_epochs}"
 add_optional_arg --customized_optimizer "${customized_optimizer}"

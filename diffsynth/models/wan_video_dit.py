@@ -122,12 +122,13 @@ def normalize_action_injection_method(method: Optional[str] = None):
         "cross_attn": "cross_attention",
         "ada_ln": "adaln",
         "ada_layer_norm": "adaln",
+        "fi_lm": "film",
     }
     method = aliases.get(method, method)
-    if method not in ("none", "context", "additive", "cross_attention", "adaln"):
+    if method not in ("none", "context", "additive", "cross_attention", "adaln", "film"):
         raise ValueError(
             "`action_injection_method` must be one of "
-            "`none`, `context`, `additive`, `cross_attention`, or `adaln`, "
+            "`none`, `context`, `additive`, `cross_attention`, `adaln`, or `film`, "
             f"got `{method}`."
         )
     return method
@@ -340,6 +341,10 @@ class DiTBlock(nn.Module):
             if not hasattr(self, "action_cross_attn"):
                 self.configure_action_injection(method)
             x = x + self.action_cross_attn(self.action_norm(x), action_emb)
+        if action_emb is not None and method == "film":
+            self._validate_token_action(action_emb, x, self.dim * 2)
+            gamma, beta = action_emb.chunk(2, dim=-1)
+            x = (1 + gamma) * x + beta
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -529,6 +534,8 @@ class WanModel(torch.nn.Module):
             return self.text_dim
         if method in ("additive", "cross_attention"):
             return self.dim
+        if method == "film":
+            return self.dim * 2
         if method == "adaln":
             return self.dim * 6
         return None

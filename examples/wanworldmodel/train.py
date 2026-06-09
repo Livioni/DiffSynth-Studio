@@ -646,11 +646,25 @@ def wan_world_model_parser():
         "--action_injection_method",
         type=str,
         default="additive",
-        choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln"),
+        choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln", "film"),
         help="Action conditioning method: `context` keeps the previous context-token scheme; the others inject action in Wan DiT blocks.",
     )
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Maximum timestep boundary ratio.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Minimum timestep boundary ratio.")
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="warmup_cosine",
+        choices=("constant", "warmup_cosine"),
+        help="Learning-rate scheduler. Defaults to linear warmup followed by cosine decay.",
+    )
+    parser.add_argument("--lr_warmup_steps", type=int, default=1000, help="Linear learning-rate warmup steps.")
+    parser.add_argument(
+        "--lr_cosine_min_ratio",
+        type=float,
+        default=0.1,
+        help="Final learning-rate ratio for warmup_cosine decay.",
+    )
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument(
         "--disable_training_checkpoint",

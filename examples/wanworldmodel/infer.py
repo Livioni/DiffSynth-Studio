@@ -442,7 +442,7 @@ def build_parser():
         "--action_injection_method",
         type=str,
         default="additive",
-        choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln"),
+        choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln", "film"),
     )
     parser.add_argument("--action_metadata_path", type=str, default="world_model_data/robotwin_aloha_testset/custom_aloha_2ep_clean/metadata.json")
     parser.add_argument("--action_metadata_key", type=str, default="robot_statistics")

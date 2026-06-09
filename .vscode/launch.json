@@ -115,7 +115,7 @@
       },
       "args": [
         "--dataset_base_path",
-        "world_model_data/robotwin_aloha",
+        "world_model_data/robotwin_aloha_testset/custom_aloha_2ep_clean",
         "--data_file_keys",
         "video",
         "--height",
@@ -141,7 +141,11 @@
         "--trainable_models",
         "dit,action_embedder",
         "--extra_inputs",
-        "input_image"
+        "input_image",
+        "--action_injection_method",
+        "film",
+        "--learning_rate",
+        "1e-4"
       ]
     },
     {

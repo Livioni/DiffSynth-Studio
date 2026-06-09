@@ -1,4 +1,4 @@
-import json, os, torch, importlib
+import json, math, os, torch, importlib
 from tqdm import tqdm
 from accelerate import Accelerator
 try:
@@ -22,6 +22,52 @@ def get_optimizer_class(customized_optimizer=None):
         module = importlib.import_module(module_name)
         print(f"Customized opimizer `{customized_optimizer}` imported.")
         return getattr(module, class_name)
+
+
+def get_lr_scheduler(
+    optimizer,
+    lr_scheduler: str = "constant",
+    total_training_steps: int = None,
+    lr_warmup_steps: int = 0,
+    lr_cosine_min_ratio: float = 1.0,
+):
+    if lr_scheduler is None or lr_scheduler == "":
+        lr_scheduler = "constant"
+    if lr_scheduler == "constant":
+        return torch.optim.lr_scheduler.ConstantLR(optimizer)
+    if lr_scheduler != "warmup_cosine":
+        raise ValueError(f"Unsupported LR scheduler: {lr_scheduler}")
+
+    lr_warmup_steps = int(lr_warmup_steps)
+    lr_cosine_min_ratio = float(lr_cosine_min_ratio)
+    if lr_warmup_steps < 0:
+        raise ValueError("--lr_warmup_steps must be >= 0.")
+    if not 0.0 <= lr_cosine_min_ratio <= 1.0:
+        raise ValueError("--lr_cosine_min_ratio must be in [0, 1].")
+
+    if total_training_steps is None:
+        raise ValueError("warmup_cosine LR scheduler requires a dataloader with known length.")
+    total_training_steps = max(1, int(total_training_steps))
+    lr_warmup_steps = min(lr_warmup_steps, total_training_steps)
+
+    def lr_lambda(current_step):
+        if lr_warmup_steps > 0 and current_step < lr_warmup_steps:
+            return float(current_step) / float(max(1, lr_warmup_steps))
+        if total_training_steps <= lr_warmup_steps:
+            return 1.0
+        progress = float(current_step - lr_warmup_steps) / float(max(1, total_training_steps - lr_warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return lr_cosine_min_ratio + (1.0 - lr_cosine_min_ratio) * cosine_factor
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def register_scheduler_for_checkpointing(accelerator: Accelerator, scheduler):
+    if not hasattr(accelerator, "_schedulers"):
+        return
+    if scheduler not in accelerator._schedulers:
+        accelerator._schedulers.append(scheduler)
 
 
 def get_training_checkpoint_root(output_path, training_checkpoint_dir=None):
@@ -120,6 +166,9 @@ def launch_training_task(
     save_training_checkpoint_enabled: bool = False,
     resume_training_checkpoint: str = None,
     training_checkpoint_dir: str = None,
+    lr_scheduler: str = "constant",
+    lr_warmup_steps: int = 0,
+    lr_cosine_min_ratio: float = 1.0,
     args = None,
     **kwargs,
 ):
@@ -137,6 +186,9 @@ def launch_training_task(
         save_training_checkpoint_enabled = getattr(args, "save_training_checkpoint", save_training_checkpoint_enabled)
         resume_training_checkpoint = getattr(args, "resume_training_checkpoint", resume_training_checkpoint)
         training_checkpoint_dir = getattr(args, "training_checkpoint_dir", training_checkpoint_dir)
+        lr_scheduler = getattr(args, "lr_scheduler", lr_scheduler)
+        lr_warmup_steps = getattr(args, "lr_warmup_steps", lr_warmup_steps)
+        lr_cosine_min_ratio = getattr(args, "lr_cosine_min_ratio", lr_cosine_min_ratio)
 
     should_save_training_checkpoint = save_training_checkpoint_enabled and save_steps is not None and save_steps > 0
     if (should_save_training_checkpoint or resume_training_checkpoint is not None) and enable_model_cpu_offload:
@@ -144,21 +196,38 @@ def launch_training_task(
 
     optimizer_class = get_optimizer_class(customized_optimizer)
     optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    prepare_scheduler_with_accelerator = lr_scheduler == "constant"
+    scheduler = get_lr_scheduler(optimizer, lr_scheduler) if prepare_scheduler_with_accelerator else None
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
     if enable_model_cpu_offload:
-        optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
+        if prepare_scheduler_with_accelerator:
+            optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
+        else:
+            optimizer, dataloader = accelerator.prepare(optimizer, dataloader)
         model.pipe.device = accelerator.device
         offload_manager = OffloadTrainingManager(model, accelerator.device, enable_optimizer_cpu_offload, cpu_offload_split_threshold)
     else:
         model.to(device=accelerator.device)
-        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+        if prepare_scheduler_with_accelerator:
+            model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+        else:
+            model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     try:
         batches_per_epoch = len(dataloader)
     except TypeError:
         batches_per_epoch = None
+    if not prepare_scheduler_with_accelerator:
+        total_training_steps = None if batches_per_epoch is None else batches_per_epoch * num_epochs
+        scheduler = get_lr_scheduler(
+            optimizer,
+            lr_scheduler=lr_scheduler,
+            total_training_steps=total_training_steps,
+            lr_warmup_steps=lr_warmup_steps,
+            lr_cosine_min_ratio=lr_cosine_min_ratio,
+        )
+        register_scheduler_for_checkpointing(accelerator, scheduler)
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     start_epoch = 0
@@ -196,7 +265,10 @@ def launch_training_task(
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
                 optimizer.step()
-                scheduler.step()
+                if prepare_scheduler_with_accelerator:
+                    scheduler.step()
+                elif getattr(accelerator, "sync_gradients", True) and not getattr(optimizer, "step_was_skipped", False):
+                    scheduler.step()
                 optimizer.zero_grad()
                 learning_rate = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else optimizer.param_groups[0]["lr"]
                 model_logger.on_step_end(accelerator, model, save_steps, log_steps=log_steps, loss=loss, learning_rate=learning_rate)
