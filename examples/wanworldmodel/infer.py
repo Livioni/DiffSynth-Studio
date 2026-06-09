@@ -414,9 +414,9 @@ def run(args):
 def build_parser():
     parser = argparse.ArgumentParser(description="Run WanWorldModel inference on a selected eval dataset window.")
 
-    parser.add_argument("--eval_dataset_base_path", type=str, default="world_model_data/robotwin_aloha_testset/custom_aloha_clean")
-    parser.add_argument("--task", type=str, default=None, help="Eval task folder. Defaults to the first indexed task.")
-    parser.add_argument("--episode", type=str, default=None, help="Episode name, e.g. episode0. Defaults to the first episode for the task.")
+    parser.add_argument("--eval_dataset_base_path", type=str, default="world_model_data/robotwin_aloha_testset/custom_aloha_2ep_clean")
+    parser.add_argument("--task", type=str, default="adjust_bottle", help="Eval task folder. Defaults to the first indexed task.")
+    parser.add_argument("--episode", type=str, default="episode0", help="Episode name, e.g. episode0. Defaults to the first episode for the task.")
     parser.add_argument("--start_frame", type=int, default=0, help="Start frame of the eval window.")
     parser.add_argument("--camera", type=str, default="head_camera")
     parser.add_argument("--include_failed", default=False, action="store_true")
@@ -429,7 +429,7 @@ def build_parser():
     parser.add_argument("--fps", type=int, default=4)
 
     parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_action_additive/step-30000.safetensors")
-    parser.add_argument("--output_dir", type=str, default="outputs/WanWorldModel_action_additive/inference")
+    parser.add_argument("--output_dir", type=str, default="outputs/inference")
     parser.add_argument("--dit_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors")
     parser.add_argument("--text_encoder_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/models_t5_umt5-xxl-enc-bf16.safetensors")
     parser.add_argument("--vae_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors")
@@ -444,7 +444,7 @@ def build_parser():
         default="additive",
         choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln"),
     )
-    parser.add_argument("--action_metadata_path", type=str, default="world_model_data/robotwin_aloha/metadata.json")
+    parser.add_argument("--action_metadata_path", type=str, default="world_model_data/robotwin_aloha_testset/custom_aloha_2ep_clean/metadata.json")
     parser.add_argument("--action_metadata_key", type=str, default="robot_statistics")
     parser.add_argument("--action_normalization_eps", type=float, default=1e-6)
     parser.add_argument(
