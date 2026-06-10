@@ -533,6 +533,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             action_normalization_mode=action_normalization_mode,
             use_text_condition=use_text_condition,
             text_context_length=text_context_length,
+            redirect_common_files=False,
         )
         self.inference_units = list(self.pipe.units)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)

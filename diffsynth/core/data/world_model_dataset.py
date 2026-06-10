@@ -75,6 +75,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
         max_data_items=None,
     ):
         self.root = root
+        self.roots = self._normalize_roots(root)
         self.tasks = self._normalize_names(tasks)
         self.cameras = tuple(self._normalize_names(cameras))
         self.num_frames = int(num_frames)
@@ -91,12 +92,24 @@ class WorldModelDataset(torch.utils.data.Dataset):
             raise ValueError("stride must be a positive integer.")
         if len(self.cameras) == 0:
             raise ValueError("At least one camera must be selected.")
-        if not os.path.isdir(self.root):
-            raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
+        missing_roots = [root for root in self.roots if not os.path.isdir(root)]
+        if missing_roots:
+            raise FileNotFoundError(f"Dataset root does not exist: {missing_roots}")
 
         self.episodes: list[_EpisodeInfo] = []
         self.windows: list[_WindowInfo] = []
         self._build_index()
+
+    @staticmethod
+    def _normalize_roots(root):
+        if isinstance(root, str):
+            roots = [name.strip() for name in root.split(",")]
+        else:
+            roots = [str(name).strip() for name in root]
+        roots = tuple(name for name in roots if name)
+        if len(roots) == 0:
+            raise ValueError("At least one dataset root must be provided.")
+        return roots
 
     @staticmethod
     def _normalize_names(names):
@@ -190,15 +203,15 @@ class WorldModelDataset(torch.utils.data.Dataset):
         index = int(torch.randint(len(text_conditions), (1,)).item())
         return text_conditions[index]
 
-    def _list_task_names(self):
+    def _list_task_names(self, root):
         if self.tasks is not None:
-            missing = [task for task in self.tasks if not os.path.isdir(os.path.join(self.root, task))]
+            missing = [task for task in self.tasks if not os.path.isdir(os.path.join(root, task))]
             if missing:
-                raise FileNotFoundError(f"Task folders do not exist under {self.root}: {missing}")
+                raise FileNotFoundError(f"Task folders do not exist under {root}: {missing}")
             return list(self.tasks)
         tasks = []
-        for name in sorted(os.listdir(self.root)):
-            path = os.path.join(self.root, name)
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
             if os.path.isdir(path) and not name.startswith("_"):
                 tasks.append(name)
         return tasks
@@ -297,21 +310,22 @@ class WorldModelDataset(torch.utils.data.Dataset):
         return min(lengths)
 
     def _build_index(self):
-        for task in self._list_task_names():
-            task_path = os.path.join(self.root, task)
-            for episode in self._list_episode_names(task_path):
-                episode_path = os.path.join(task_path, episode)
-                meta = self._load_json(os.path.join(episode_path, "meta.json"))
-                if not self.include_failed and not self._is_successful(meta):
-                    continue
-                length = self._episode_length(episode_path)
-                if length is None or length < self.num_frames:
-                    continue
-                text_conditions = self._load_text_conditions(episode_path, episode, task)
-                episode_id = len(self.episodes)
-                self.episodes.append(_EpisodeInfo(task, episode, episode_path, meta, text_conditions, length))
-                for start in range(0, length - self.num_frames + 1, self.stride):
-                    self.windows.append(_WindowInfo(episode_id, start))
+        for root in self.roots:
+            for task in self._list_task_names(root):
+                task_path = os.path.join(root, task)
+                for episode in self._list_episode_names(task_path):
+                    episode_path = os.path.join(task_path, episode)
+                    meta = self._load_json(os.path.join(episode_path, "meta.json"))
+                    if not self.include_failed and not self._is_successful(meta):
+                        continue
+                    length = self._episode_length(episode_path)
+                    if length is None or length < self.num_frames:
+                        continue
+                    text_conditions = self._load_text_conditions(episode_path, episode, task)
+                    episode_id = len(self.episodes)
+                    self.episodes.append(_EpisodeInfo(task, episode, episode_path, meta, text_conditions, length))
+                    for start in range(0, length - self.num_frames + 1, self.stride):
+                        self.windows.append(_WindowInfo(episode_id, start))
 
     def _load_rgb_window(self, episode_path, camera, frame_indices):
         folder = os.path.join(episode_path, "camera_data", "images", camera)

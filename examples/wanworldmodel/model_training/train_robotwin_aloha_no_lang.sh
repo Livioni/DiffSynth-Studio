@@ -12,7 +12,7 @@ export TOKENIZERS_PARALLELISM=false
 # =========================
 # accelerate
 # =========================
-num_processes=4  # 启动的训练进程数，通常等于 GPU 数。
+num_processes=6   # 启动的训练进程数，通常等于 GPU 数。
 
 # =========================
 # path
@@ -23,8 +23,8 @@ log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 # =========================
 # dataset
 # =========================
-dataset_base_path="world_model_data/robotwin_aloha"  # 训练数据根目录。
-dataset_metadata_path=""  # unified 数据集 metadata 路径；world_model 模式通常留空。
+dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/robotwin_aloha_fail"  # 训练数据根目录，多个 root 用逗号分隔。
+dataset_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # unified 数据集 metadata 路径；world_model 模式通常留空。
 dataset_type="world_model"  # 数据集类型：auto、unified 或 world_model。
 dataset_repeat=5  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
 dataset_num_workers=0  # 训练 DataLoader worker 数。
@@ -112,7 +112,7 @@ action_normalization_mode="standard"  # action 归一化模式：standard=(actio
 # =========================
 # eval
 # =========================
-eval_dataset_base_path="world_model_data/robotwin_aloha_testset/custom_aloha_clean"  # 评估数据根目录；设空跳过 eval dataset。
+eval_dataset_base_path="world_model_data/robotwin_aloha/val_set"  # 评估数据根目录；设空跳过 eval dataset。
 eval_steps=2000  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
 eval_num_inference_steps=50  # eval 推理的 diffusion steps。
 eval_max_samples=4  # eval 最多评估多少个 window。
