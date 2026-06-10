@@ -63,6 +63,8 @@ class WanWorldModelPipeline(BasePipeline):
         action_metadata_key: str = "robot_statistics",
         action_normalization_eps: float = 1e-6,
         action_normalization_mode: str = "standard",
+        use_text_condition: bool = True,
+        text_context_length: int = 512,
     ):
         super().__init__(
             device=device,
@@ -72,14 +74,20 @@ class WanWorldModelPipeline(BasePipeline):
             time_division_factor=4,
             time_division_remainder=1,
         )
+        if int(text_context_length) <= 0:
+            raise ValueError("text_context_length must be a positive integer.")
         self.scheduler = FlowMatchScheduler("Wan")
         self.tokenizer: HuggingfaceTokenizer = None
         self.text_encoder: WanTextEncoder = None
         self.dit: WanModel = None
         self.vae: WanVideoVAE = None
+        self.use_text_condition = bool(use_text_condition)
+        self.text_context_length = int(text_context_length)
         self.action_dim = action_dim
         self.action_embedder_hidden_dim = action_embedder_hidden_dim
         self.action_injection_method = normalize_action_injection_method(action_injection_method)
+        if not self.use_text_condition and action_dim is not None and self.action_injection_method == "context":
+            raise ValueError("`action_injection_method=context` requires language/context attention. Use additive, cross_attention, adaln, or film when language conditioning is disabled.")
         self.action_metadata_path = action_metadata_path
         self.action_metadata_key = action_metadata_key
         self.action_normalization_eps = action_normalization_eps
@@ -177,6 +185,17 @@ class WanWorldModelPipeline(BasePipeline):
             ModelConfig(model_id=cls.model_id, origin_file_pattern="Wan2.2_VAE.pth", **kwargs),
         ]
 
+    @staticmethod
+    def _is_text_encoder_config(model_config: ModelConfig):
+        values = []
+        for value in (model_config.path, model_config.model_id, model_config.origin_file_pattern):
+            if isinstance(value, (list, tuple)):
+                values.extend(value)
+            elif value is not None:
+                values.append(value)
+        text_encoder_markers = ("umt5", "models_t5", "text_encoder")
+        return any(any(marker in str(value).lower() for marker in text_encoder_markers) for value in values)
+
     @classmethod
     def from_pretrained(
         cls,
@@ -193,10 +212,12 @@ class WanWorldModelPipeline(BasePipeline):
         action_metadata_key: str = "robot_statistics",
         action_normalization_eps: float = 1e-6,
         action_normalization_mode: str = "standard",
+        use_text_condition: bool = True,
+        text_context_length: int = 512,
     ):
         if model_configs is None:
             model_configs = cls.default_model_configs()
-        if tokenizer_config is None:
+        if use_text_condition and tokenizer_config is None:
             tokenizer_config = ModelConfig(model_id=cls.model_id, origin_file_pattern="google/umt5-xxl/")
 
         # 公共权重重定向到 DiffSynth 已转换 safetensors，避免重复下载原始 pth 文件。
@@ -213,6 +234,9 @@ class WanWorldModelPipeline(BasePipeline):
                     model_config.model_id = redirect_dict[model_config.origin_file_pattern][0]
                     model_config.origin_file_pattern = redirect_dict[model_config.origin_file_pattern][1]
 
+        if not use_text_condition:
+            model_configs = [model_config for model_config in model_configs if not cls._is_text_encoder_config(model_config)]
+
         pipe = cls(
             device=device,
             torch_dtype=torch_dtype,
@@ -223,11 +247,13 @@ class WanWorldModelPipeline(BasePipeline):
             action_metadata_key=action_metadata_key,
             action_normalization_eps=action_normalization_eps,
             action_normalization_mode=action_normalization_mode,
+            use_text_condition=use_text_condition,
+            text_context_length=text_context_length,
         )
         model_pool = pipe.download_and_load_models(model_configs, vram_limit)
 
         # Wan World Model 只需要文本编码器、DiT 和 VAE；audio 相关模型与 processor 不加载。
-        pipe.text_encoder = model_pool.fetch_model("wan_video_text_encoder")
+        pipe.text_encoder = model_pool.fetch_model("wan_video_text_encoder") if use_text_condition else None
         pipe.dit = model_pool.fetch_model("wan_video_dit")
         pipe.vae = model_pool.fetch_model("wan_video_vae")
         pipe.build_action_embedder(
@@ -240,8 +266,9 @@ class WanWorldModelPipeline(BasePipeline):
             pipe.height_division_factor = pipe.vae.upsampling_factor * 2
             pipe.width_division_factor = pipe.vae.upsampling_factor * 2
 
-        tokenizer_config.download_if_necessary()
-        pipe.tokenizer = HuggingfaceTokenizer(name=tokenizer_config.path, seq_len=512, clean="whitespace")
+        if use_text_condition:
+            tokenizer_config.download_if_necessary()
+            pipe.tokenizer = HuggingfaceTokenizer(name=tokenizer_config.path, seq_len=text_context_length, clean="whitespace")
 
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
@@ -284,6 +311,7 @@ class WanWorldModelPipeline(BasePipeline):
             "tile_size": tile_size,
             "tile_stride": tile_stride,
             "action": action,
+            "disable_context_attention": not self.use_text_condition,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -381,6 +409,17 @@ class WanWorldModelUnit_PromptEmbedder(PipelineUnit):
         )
 
     def process(self, pipe: WanWorldModelPipeline, prompt) -> dict:
+        if not pipe.use_text_condition:
+            if pipe.dit is None:
+                raise ValueError("DiT must be loaded before creating the empty text context placeholder.")
+            batch_size = len(prompt) if isinstance(prompt, (list, tuple)) else 1
+            prompt_emb = torch.empty(
+                (batch_size, 0, pipe.dit.text_dim),
+                dtype=pipe.torch_dtype,
+                device=pipe.device,
+            )
+            return {"context": prompt_emb}
+
         pipe.load_models_to_device(self.onload_model_names)
         ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(pipe.device)

@@ -145,7 +145,8 @@
         "--action_injection_method",
         "film",
         "--learning_rate",
-        "1e-4"
+        "1e-4",
+        "--no_language_condition"
       ]
     },
     {

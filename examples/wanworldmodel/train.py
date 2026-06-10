@@ -330,7 +330,7 @@ class WanWorldModelEvalCallback:
         )
         x_gt = resize_pil_video(x_gt, target_width, target_height)
         x_pred = pipe(
-            prompt=data["prompt"],
+            prompt=data.get("prompt", ""),
             negative_prompt="",
             input_image=x_gt[0],
             seed=sample_id,
@@ -471,6 +471,8 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         action_metadata_key="robot_statistics",
         action_normalization_eps=1e-6,
         action_normalization_mode="standard",
+        use_text_condition=True,
+        text_context_length=512,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -514,16 +516,21 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             action_metadata_key=action_metadata_key,
             action_normalization_eps=action_normalization_eps,
             action_normalization_mode=action_normalization_mode,
+            use_text_condition=use_text_condition,
+            text_context_length=text_context_length,
         )
         self.inference_units = list(self.pipe.units)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
+        self.use_text_condition = bool(use_text_condition)
 
         self.switch_pipe_to_training_mode(
             self.pipe,
             trainable_models,
             task=task,
         )
+        if not self.use_text_condition:
+            self.freeze_language_condition_modules()
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
@@ -543,6 +550,20 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
 
+    def freeze_language_condition_modules(self):
+        dit = self.pipe.dit
+        if dit is None:
+            return
+        if hasattr(dit, "text_embedding"):
+            dit.text_embedding.eval()
+            dit.text_embedding.requires_grad_(False)
+        for block in getattr(dit, "blocks", []):
+            for name in ("cross_attn", "norm3"):
+                module = getattr(block, name, None)
+                if module is not None:
+                    module.eval()
+                    module.requires_grad_(False)
+
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
             if extra_input == "input_image":
@@ -555,7 +576,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         return inputs_shared
 
     def get_pipeline_inputs(self, data):
-        inputs_posi = {"prompt": data["prompt"]}
+        inputs_posi = {"prompt": data["prompt"] if self.use_text_condition else data.get("prompt", "")}
         inputs_nega = {}
         inputs_shared = {
             "input_video": data["video"],
@@ -569,6 +590,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
             "max_timestep_boundary": self.max_timestep_boundary,
             "min_timestep_boundary": self.min_timestep_boundary,
+            "disable_context_attention": not self.use_text_condition,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
@@ -585,6 +607,8 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
 
 def wan_world_model_parser():
     parser = argparse.ArgumentParser(description="WanWorldModelPipeline training script.")
+
+    # Shared DiffSynth training/parser options.
     parser = add_dataset_base_config(parser)
     parser = add_model_config(parser)
     parser = add_training_config(parser)
@@ -594,9 +618,15 @@ def wan_world_model_parser():
     parser = add_offload_training_config(parser)
     parser = add_logger_config(parser)
     parser = add_video_size_config(parser)
+
+    # Wan world-model defaults.
     parser.set_defaults(data_file_keys="video", extra_inputs="input_image", enable_tensorboard_log=True)
+
+    # Logging.
     parser.add_argument("--disable_tensorboard_log", dest="enable_tensorboard_log", default=True, action="store_false", help="Disable tensorboard logging.")
     parser.add_argument("--log_steps", type=int, default=10, help="Log train scalar metrics every N training steps. Set <= 0 to log every step.")
+
+    # Dataset backend.
     parser.add_argument(
         "--dataset_type",
         type=str,
@@ -604,6 +634,8 @@ def wan_world_model_parser():
         choices=("auto", "unified", "world_model"),
         help="Dataset backend. Defaults to WorldModelDataset. Use `unified` for metadata/cached data, or `auto` to detect it.",
     )
+
+    # WorldModelDataset indexing and camera streams.
     parser.add_argument("--world_model_tasks", type=str, default=None, help="Comma-separated task folders to load from WorldModelDataset.")
     parser.add_argument("--world_model_cameras", type=str, default=None, help="Comma-separated cameras to load. Defaults to --world_model_video_camera.")
     parser.add_argument("--world_model_video_camera", type=str, default="head_camera", help="Camera RGB stream used as training video.")
@@ -611,6 +643,8 @@ def wan_world_model_parser():
     parser.add_argument("--world_model_include_depth", default=False, action="store_true", help="Load depth arrays from WorldModelDataset.")
     parser.add_argument("--world_model_include_camera_params", default=False, action="store_true", help="Load camera intrinsics/extrinsics from WorldModelDataset.")
     parser.add_argument("--world_model_include_failed", default=False, action="store_true", help="Include failed episodes from WorldModelDataset.")
+
+    # Periodic evaluation.
     parser.add_argument(
         "--eval_dataset_base_path",
         type=str,
@@ -624,7 +658,25 @@ def wan_world_model_parser():
     parser.add_argument("--eval_num_videos_to_log", type=int, default=4, help="Number of eval samples whose videos are logged.")
     parser.add_argument("--eval_video_fps", type=int, default=4, help="FPS for logged eval videos.")
     parser.add_argument("--eval_metric_batch_size", type=int, default=4, help="Batch size for LPIPS/FID metric models.")
+
+    # Language / text conditioning.
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    parser.add_argument(
+        "--disable_language_condition",
+        "--no_language_condition",
+        dest="use_text_condition",
+        default=True,
+        action="store_false",
+        help="Disable prompt/language conditioning. The pipeline skips context attention and does not load the text encoder/tokenizer.",
+    )
+    parser.add_argument(
+        "--text_context_length",
+        type=int,
+        default=512,
+        help="Text context token length used when language conditioning is enabled.",
+    )
+
+    # Robot action conditioning.
     parser.add_argument("--action_dim", type=int, default=14, help="Robot action vector dimension. Enable action conditioning when set.")
     parser.add_argument(
         "--action_metadata_path",
@@ -649,8 +701,12 @@ def wan_world_model_parser():
         choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln", "film"),
         help="Action conditioning method: `context` keeps the previous context-token scheme; the others inject action in Wan DiT blocks.",
     )
+
+    # Diffusion timestep sampling.
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Maximum timestep boundary ratio.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Minimum timestep boundary ratio.")
+
+    # Optimizer schedule.
     parser.add_argument(
         "--lr_scheduler",
         type=str,
@@ -665,6 +721,8 @@ def wan_world_model_parser():
         default=0.1,
         help="Final learning-rate ratio for warmup_cosine decay.",
     )
+
+    # Initialization and full training-state checkpoints.
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument(
         "--disable_training_checkpoint",
@@ -744,6 +802,8 @@ if __name__ == "__main__":
         action_metadata_key=args.action_metadata_key,
         action_normalization_eps=args.action_normalization_eps,
         action_normalization_mode=args.action_normalization_mode,
+        use_text_condition=args.use_text_condition,
+        text_context_length=args.text_context_length,
     )
     model_logger = ModelLogger(
         args.output_path,

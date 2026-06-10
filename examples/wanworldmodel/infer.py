@@ -198,11 +198,13 @@ def select_window(dataset, task=None, episode_name=None, start_frame=0):
 def make_model_configs(args):
     from diffsynth.pipelines.wan_world_model import ModelConfig
 
-    return [
-        ModelConfig(path=resolve_path_or_glob(args.text_encoder_path)),
+    model_configs = [
         ModelConfig(path=resolve_path_or_glob(args.dit_path)),
         ModelConfig(path=resolve_path_or_glob(args.vae_path)),
     ]
+    if args.use_text_condition:
+        model_configs.insert(0, ModelConfig(path=resolve_path_or_glob(args.text_encoder_path)))
+    return model_configs
 
 
 def load_finetuned_checkpoint(pipe, checkpoint_path, strict_checkpoint=False):
@@ -299,6 +301,8 @@ def build_pipeline(args):
         action_metadata_key=args.action_metadata_key,
         action_normalization_eps=args.action_normalization_eps,
         action_normalization_mode=args.action_normalization_mode,
+        use_text_condition=args.use_text_condition,
+        text_context_length=args.text_context_length,
     )
     load_finetuned_checkpoint(pipe, args.checkpoint_path, strict_checkpoint=args.strict_checkpoint)
     pipe.eval()
@@ -386,6 +390,7 @@ def run(args):
         "episode_path": data["episode_path"],
         "camera": args.camera,
         "prompt": prompt,
+        "use_text_condition": bool(args.use_text_condition),
         "start_frame": int(args.start_frame),
         "frame_indices": [int(item) for item in data["frame_indices"].tolist()],
         "num_frames_requested": int(args.num_frames),
@@ -435,6 +440,20 @@ def build_parser():
     parser.add_argument("--vae_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors")
     parser.add_argument("--tokenizer_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/google/umt5-xxl")
     parser.add_argument("--strict_checkpoint", default=False, action="store_true")
+    parser.add_argument(
+        "--disable_language_condition",
+        "--no_language_condition",
+        dest="use_text_condition",
+        default=True,
+        action="store_false",
+        help="Disable prompt/language conditioning. The pipeline skips context attention and does not load the text encoder/tokenizer.",
+    )
+    parser.add_argument(
+        "--text_context_length",
+        type=int,
+        default=512,
+        help="Text context token length used when language conditioning is enabled.",
+    )
 
     parser.add_argument("--action_dim", type=int, default=None, help="Defaults to the checkpoint action embedder input dim.")
     parser.add_argument("--action_embedder_hidden_dim", type=int, default=None, help="Defaults to the checkpoint action embedder hidden dim.")

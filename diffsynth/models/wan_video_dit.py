@@ -281,6 +281,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
         self.action_injection_method = "none"
+        self.disable_context_attention = False
 
     def configure_action_injection(self, method: Optional[str] = None):
         method = normalize_action_injection_method(method)
@@ -300,7 +301,9 @@ class DiTBlock(nn.Module):
                 f"Action embedding dim {action_emb.shape[-1]} does not match expected dim {expected_dim}."
             )
 
-    def forward(self, x, context, t_mod, freqs, action_emb=None):
+    def forward(self, x, context, t_mod, freqs, action_emb=None, disable_context_attention=None):
+        if disable_context_attention is None:
+            disable_context_attention = getattr(self, "disable_context_attention", False)
         method = getattr(self, "action_injection_method", "none")
         if method in ("none", "context"):
             action_emb = None
@@ -332,7 +335,8 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+        if not disable_context_attention:
+            x = x + self.cross_attn(self.norm3(x), context)
         if action_emb is not None and method == "cross_attention":
             if action_emb.shape[-1] != self.dim:
                 raise ValueError(
@@ -641,17 +645,20 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                disable_context_attention: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
-        context = self.text_embedding(context)
+        if not disable_context_attention:
+            context = self.text_embedding(context)
         
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-            clip_embdding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embdding, context], dim=1)
+            if not disable_context_attention:
+                clip_embdding = self.img_emb(clip_feature)
+                context = torch.cat([clip_embdding, context], dim=1)
         
         x, (f, h, w) = self.patchify(x)
         
@@ -662,6 +669,7 @@ class WanModel(torch.nn.Module):
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
         for block in self.blocks:
+            block.disable_context_attention = disable_context_attention
             if self.training:
                 x = gradient_checkpoint_forward(
                     block,

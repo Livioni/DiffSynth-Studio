@@ -1361,6 +1361,7 @@ def model_fn_wan_video(
     wantodance_fps: float = 30.0,
     music_feature = None,
     skip_9th_layer: bool = False,
+    disable_context_attention: bool = False,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1382,6 +1383,7 @@ def model_fn_wan_video(
             tea_cache=tea_cache,
             use_unified_sequence_parallel=use_unified_sequence_parallel,
             motion_bucket_id=motion_bucket_id,
+            disable_context_attention=disable_context_attention,
         )
         return TemporalTiler_BCTHW().run(
             model_fn_wan_video,
@@ -1444,19 +1446,28 @@ def model_fn_wan_video(
     # Motion Controller
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
-    context = dit.text_embedding(context)
+    if disable_context_attention and (
+        vace_context is not None
+        or vap is not None
+        or wantodance_refimage_feature is not None
+        or music_feature is not None
+    ):
+        raise ValueError("disable_context_attention is not supported with context-dependent VACE/VAP/WanToDance adapters.")
+    context_batch_size = latents.shape[0] if context is None else context.shape[0]
+    if not disable_context_attention:
+        context = dit.text_embedding(context)
 
     x = latents
     # Merged cfg
-    if x.shape[0] != context.shape[0]:
-        x = torch.concat([x] * context.shape[0], dim=0)
-    if timestep.shape[0] != context.shape[0]:
-        timestep = torch.concat([timestep] * context.shape[0], dim=0)
+    if x.shape[0] != context_batch_size:
+        x = torch.concat([x] * context_batch_size, dim=0)
+    if timestep.shape[0] != context_batch_size:
+        timestep = torch.concat([timestep] * context_batch_size, dim=0)
 
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
         x = torch.cat([x, y], dim=1)
-    if clip_feature is not None and dit.require_clip_embedding:
+    if clip_feature is not None and dit.require_clip_embedding and not disable_context_attention:
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
         
@@ -1602,6 +1613,7 @@ def model_fn_wan_video(
         
         # Block
         for block_id, block in enumerate(dit.blocks):
+            block.disable_context_attention = disable_context_attention
             if skip_9th_layer:
                 # This is only used in WanToDance
                 if block_id == 9:
