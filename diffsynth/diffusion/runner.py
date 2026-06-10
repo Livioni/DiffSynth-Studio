@@ -63,6 +63,137 @@ def get_lr_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def safe_len(value):
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def get_dataloader_batch_size(dataloader):
+    batch_size = getattr(dataloader, "batch_size", None)
+    if batch_size is not None:
+        return int(batch_size)
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    batch_size = getattr(batch_sampler, "batch_size", None)
+    return None if batch_size is None else int(batch_size)
+
+
+def format_rank_allocations(dataset_length, num_processes, sample_slots_per_rank):
+    if sample_slots_per_rank is None:
+        return ", ".join(f"rank{rank}:unknown" for rank in range(num_processes))
+    if dataset_length is None:
+        return ", ".join(f"rank{rank}:{sample_slots_per_rank} sample slots" for rank in range(num_processes))
+
+    base_unique = dataset_length // num_processes
+    extra_unique = dataset_length % num_processes
+    rows = []
+    for rank in range(num_processes):
+        unique_estimate = base_unique + (1 if rank < extra_unique else 0)
+        padded_or_reused = max(0, sample_slots_per_rank - unique_estimate)
+        rows.append(
+            f"rank{rank}:{sample_slots_per_rank} slots"
+            f"({unique_estimate} unique est., {padded_or_reused} padded/reused)"
+        )
+    return ", ".join(rows)
+
+
+def print_training_sample_plan(
+    accelerator: Accelerator,
+    dataset_length,
+    dataloader_batches_before_shard,
+    batches_per_epoch,
+    per_device_batch_size,
+    num_epochs,
+):
+    if not accelerator.is_main_process:
+        return
+
+    num_processes = accelerator.num_processes
+    sample_slots_per_rank = None if batches_per_epoch is None else batches_per_epoch * per_device_batch_size
+    global_sample_slots = None if sample_slots_per_rank is None else sample_slots_per_rank * num_processes
+    padded_or_reused = (
+        None
+        if dataset_length is None or global_sample_slots is None
+        else max(0, global_sample_slots - dataset_length)
+    )
+    effective_samples_per_optimizer_step = per_device_batch_size * num_processes * accelerator.gradient_accumulation_steps
+
+    print(
+        "[Training sample plan] "
+        f"dataset_samples_per_epoch={dataset_length}; "
+        f"dataloader_batches_before_shard={dataloader_batches_before_shard}; "
+        f"num_processes/GPU_cards={num_processes}; "
+        f"per_device_batch_size={per_device_batch_size}; "
+        f"gradient_accumulation_steps={accelerator.gradient_accumulation_steps}; "
+        f"effective_samples_per_optimizer_step={effective_samples_per_optimizer_step}"
+    )
+    print(
+        "[Training sample plan] "
+        f"batches_per_epoch_per_rank={batches_per_epoch}; "
+        f"sample_slots_per_rank={sample_slots_per_rank}; "
+        f"global_sample_slots_per_epoch={global_sample_slots}; "
+        f"padded_or_reused_slots_per_epoch={padded_or_reused}; "
+        f"num_epochs={num_epochs}"
+    )
+    print(
+        "[Training sample plan] rank allocation: "
+        + format_rank_allocations(dataset_length, num_processes, sample_slots_per_rank)
+    )
+
+
+def print_epoch_sample_calculation(
+    accelerator: Accelerator,
+    epoch_id,
+    num_epochs,
+    dataset_length,
+    batches_per_epoch,
+    per_device_batch_size,
+    skip_batches=0,
+):
+    if not accelerator.is_main_process:
+        return
+
+    if batches_per_epoch is None:
+        print(
+            f"[Epoch {epoch_id + 1}/{num_epochs}] sample calculation: "
+            f"dataset_samples={dataset_length}; batches_per_rank=unknown; skip_batches={skip_batches}"
+        )
+        return
+
+    remaining_batches = max(0, batches_per_epoch - skip_batches)
+    sample_slots_per_rank = remaining_batches * per_device_batch_size
+    global_sample_slots = sample_slots_per_rank * accelerator.num_processes
+    skipped_global_slots = skip_batches * per_device_batch_size * accelerator.num_processes
+    remaining_dataset_samples = (
+        None
+        if dataset_length is None
+        else max(0, dataset_length - min(dataset_length, skipped_global_slots))
+    )
+    padded_or_reused = (
+        None
+        if remaining_dataset_samples is None
+        else max(0, global_sample_slots - remaining_dataset_samples)
+    )
+    optimizer_updates = math.ceil(remaining_batches / accelerator.gradient_accumulation_steps)
+    print(
+        f"[Epoch {epoch_id + 1}/{num_epochs}] sample calculation: "
+        f"dataset_samples={dataset_length}; "
+        f"skip_batches_per_rank={skip_batches}; "
+        f"skipped_global_sample_slots={skipped_global_slots}; "
+        f"remaining_dataset_samples_est={remaining_dataset_samples}; "
+        f"remaining_batches_per_rank={remaining_batches}; "
+        f"sample_slots_per_rank={sample_slots_per_rank}; "
+        f"global_sample_slots={global_sample_slots}; "
+        f"padded_or_reused_slots={padded_or_reused}; "
+        f"estimated_optimizer_updates_per_rank={optimizer_updates}"
+    )
+    print(
+        f"[Epoch {epoch_id + 1}/{num_epochs}] rank allocation: "
+        + format_rank_allocations(remaining_dataset_samples, accelerator.num_processes, sample_slots_per_rank)
+    )
+
+
 def register_scheduler_for_checkpointing(accelerator: Accelerator, scheduler):
     if not hasattr(accelerator, "_schedulers"):
         return
@@ -199,6 +330,9 @@ def launch_training_task(
     prepare_scheduler_with_accelerator = lr_scheduler == "constant"
     scheduler = get_lr_scheduler(optimizer, lr_scheduler) if prepare_scheduler_with_accelerator else None
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataset_length = safe_len(dataset)
+    dataloader_batches_before_shard = safe_len(dataloader)
+    per_device_batch_size = get_dataloader_batch_size(dataloader) or 1
 
     if enable_model_cpu_offload:
         if prepare_scheduler_with_accelerator:
@@ -218,6 +352,14 @@ def launch_training_task(
         batches_per_epoch = len(dataloader)
     except TypeError:
         batches_per_epoch = None
+    print_training_sample_plan(
+        accelerator,
+        dataset_length=dataset_length,
+        dataloader_batches_before_shard=dataloader_batches_before_shard,
+        batches_per_epoch=batches_per_epoch,
+        per_device_batch_size=per_device_batch_size,
+        num_epochs=num_epochs,
+    )
     if not prepare_scheduler_with_accelerator:
         total_training_steps = None if batches_per_epoch is None else batches_per_epoch * num_epochs
         scheduler = get_lr_scheduler(
@@ -245,6 +387,15 @@ def launch_training_task(
 
     for epoch_id in range(start_epoch, num_epochs):
         skip_batches = start_batch_in_epoch if epoch_id == start_epoch else 0
+        print_epoch_sample_calculation(
+            accelerator,
+            epoch_id=epoch_id,
+            num_epochs=num_epochs,
+            dataset_length=dataset_length,
+            batches_per_epoch=batches_per_epoch,
+            per_device_batch_size=per_device_batch_size,
+            skip_batches=skip_batches,
+        )
         if skip_batches > 0 and accelerator.is_main_process:
             print(f"Skip {skip_batches} already-trained batches in epoch {epoch_id}.")
         epoch_dataloader = dataloader

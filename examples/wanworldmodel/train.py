@@ -3,6 +3,8 @@ import json
 import math
 import os
 import warnings
+from collections import defaultdict
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 import accelerate
 import numpy as np
@@ -69,6 +71,72 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.dataset)
 
+    def sample_statistics(self):
+        episodes = getattr(self.dataset, "episodes", None)
+        windows = getattr(self.dataset, "windows", None)
+        if episodes is None or windows is None:
+            return None
+
+        raw_counts = [0 for _ in episodes]
+        for window in windows:
+            raw_counts[window.episode_id] += 1
+
+        effective_counts = [0 for _ in episodes]
+        effective_sample_count = len(self)
+        unique_sample_count = len(windows)
+        if unique_sample_count > 0 and effective_sample_count > 0:
+            full_cycles, remainder = divmod(effective_sample_count, unique_sample_count)
+            effective_counts = [count * full_cycles for count in raw_counts]
+            for window in windows[:remainder]:
+                effective_counts[window.episode_id] += 1
+
+        task_rows = defaultdict(lambda: {"episodes": 0, "unique_samples": 0, "effective_samples": 0})
+        episode_rows = []
+        for episode_id, episode in enumerate(episodes):
+            root = self._episode_root(episode.path)
+            root_label = os.path.basename(root.rstrip(os.sep)) if root else ""
+            sample_name = os.path.relpath(episode.path, root) if root else os.path.join(episode.task, episode.episode)
+            if root_label:
+                sample_name = os.path.join(root_label, sample_name)
+            task_key = os.path.join(root_label, episode.task) if root_label else episode.task
+            task_rows[task_key]["episodes"] += 1
+            task_rows[task_key]["unique_samples"] += raw_counts[episode_id]
+            task_rows[task_key]["effective_samples"] += effective_counts[episode_id]
+            episode_rows.append(
+                {
+                    "name": sample_name,
+                    "frames": episode.length,
+                    "unique_samples": raw_counts[episode_id],
+                    "effective_samples": effective_counts[episode_id],
+                }
+            )
+
+        return {
+            "roots": getattr(self.dataset, "roots", ()),
+            "cameras": getattr(self.dataset, "cameras", ()),
+            "video_camera": self.video_camera,
+            "num_frames": getattr(self.dataset, "num_frames", None),
+            "stride": getattr(self.dataset, "stride", None),
+            "repeat": getattr(self.dataset, "repeat", None),
+            "max_data_items": getattr(self.dataset, "max_data_items", None),
+            "episode_count": len(episodes),
+            "unique_sample_count": unique_sample_count,
+            "effective_sample_count": effective_sample_count,
+            "task_rows": dict(sorted(task_rows.items())),
+            "episode_rows": episode_rows,
+        }
+
+    def _episode_root(self, episode_path):
+        episode_path = os.path.abspath(episode_path)
+        for root in getattr(self.dataset, "roots", ()):
+            root_path = os.path.abspath(root)
+            try:
+                if os.path.commonpath((root_path, episode_path)) == root_path:
+                    return root
+            except ValueError:
+                continue
+        return None
+
     @staticmethod
     def action_value_to_delta_tensor(value):
         value = torch.as_tensor(value)
@@ -116,6 +184,54 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
         if action is not None:
             data["action"] = action
         return data
+
+
+@contextmanager
+def main_process_output(is_main_process):
+    if is_main_process:
+        yield
+        return
+    with open(os.devnull, "w") as devnull:
+        with redirect_stdout(devnull), redirect_stderr(devnull):
+            yield
+
+
+def print_world_model_training_dataset_summary(dataset, accelerator, label):
+    if not accelerator.is_main_process:
+        return
+    sample_statistics = getattr(dataset, "sample_statistics", None)
+    stats = sample_statistics() if sample_statistics is not None else None
+    if stats is None:
+        print(f"[Dataset:{label}] samples_per_epoch={len(dataset)}")
+        return
+
+    roots = ", ".join(stats["roots"])
+    cameras = ", ".join(stats["cameras"])
+    max_data_items = stats["max_data_items"] if stats["max_data_items"] is not None else "None"
+    print(
+        f"[WorldModelTrainingDataset:{label}] roots={roots}; cameras={cameras}; "
+        f"video_camera={stats['video_camera']}; num_frames={stats['num_frames']}; "
+        f"stride={stats['stride']}; repeat={stats['repeat']}; max_data_items={max_data_items}"
+    )
+    print(
+        f"[WorldModelTrainingDataset:{label}] episodes={stats['episode_count']}; "
+        f"unique_samples/windows={stats['unique_sample_count']}; "
+        f"samples_per_epoch_after_repeat={stats['effective_sample_count']}"
+    )
+    print(f"[WorldModelTrainingDataset:{label}] task sample counts:")
+    for task_name, row in stats["task_rows"].items():
+        print(
+            f"  {task_name}: episodes={row['episodes']}, "
+            f"unique_samples/windows={row['unique_samples']}, "
+            f"samples_per_epoch_after_repeat={row['effective_samples']}"
+        )
+    print(f"[WorldModelTrainingDataset:{label}] episode sample counts:")
+    for row in stats["episode_rows"]:
+        print(
+            f"  {row['name']}: frames={row['frames']}, "
+            f"unique_samples/windows={row['unique_samples']}, "
+            f"samples_per_epoch_after_repeat={row['effective_samples']}"
+        )
 
 
 def build_unified_dataset(args):
@@ -770,14 +886,18 @@ if __name__ == "__main__":
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
     dataset = build_dataset(args)
+    print_world_model_training_dataset_summary(dataset, accelerator, label="train")
     eval_dataset = None
     if args.eval_steps > 0 and not args.task.endswith(":data_process"):
         eval_dataset = build_eval_dataset(args)
     if eval_dataset is not None and len(eval_dataset) == 0:
         warnings.warn("Eval dataset is empty, skip periodic eval.")
         eval_dataset = None
+    if eval_dataset is not None:
+        print_world_model_training_dataset_summary(eval_dataset, accelerator, label="eval")
     if eval_dataset is not None and args.enable_model_cpu_offload:
         raise ValueError("Periodic eval is not supported with --enable_model_cpu_offload. Disable eval or model CPU offload.")
+    accelerator.wait_for_everyone()
 
     action_enabled = args.action_dim is not None and normalize_action_injection_method(args.action_injection_method) != "none"
     action_metadata_path = None
@@ -795,32 +915,34 @@ if __name__ == "__main__":
             )
         resume_model_checkpoint = None
 
-    model = WanWorldModelTrainingModule(
-        model_paths=args.model_paths,
-        model_id_with_origin_paths=args.model_id_with_origin_paths,
-        tokenizer_path=args.tokenizer_path,
-        trainable_models=args.trainable_models,
-        use_gradient_checkpointing=args.use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
-        extra_inputs=args.extra_inputs,
-        fp8_models=args.fp8_models,
-        offload_models=args.offload_models,
-        resume_from_checkpoint=resume_model_checkpoint,
-        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-        task=args.task,
-        device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
-        max_timestep_boundary=args.max_timestep_boundary,
-        min_timestep_boundary=args.min_timestep_boundary,
-        action_dim=args.action_dim,
-        action_embedder_hidden_dim=args.action_embedder_hidden_dim,
-        action_injection_method=args.action_injection_method,
-        action_metadata_path=action_metadata_path,
-        action_metadata_key=args.action_metadata_key,
-        action_normalization_eps=args.action_normalization_eps,
-        action_normalization_mode=args.action_normalization_mode,
-        use_text_condition=args.use_text_condition,
-        text_context_length=args.text_context_length,
-    )
+    with main_process_output(accelerator.is_main_process):
+        model = WanWorldModelTrainingModule(
+            model_paths=args.model_paths,
+            model_id_with_origin_paths=args.model_id_with_origin_paths,
+            tokenizer_path=args.tokenizer_path,
+            trainable_models=args.trainable_models,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+            extra_inputs=args.extra_inputs,
+            fp8_models=args.fp8_models,
+            offload_models=args.offload_models,
+            resume_from_checkpoint=resume_model_checkpoint,
+            remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+            task=args.task,
+            device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
+            max_timestep_boundary=args.max_timestep_boundary,
+            min_timestep_boundary=args.min_timestep_boundary,
+            action_dim=args.action_dim,
+            action_embedder_hidden_dim=args.action_embedder_hidden_dim,
+            action_injection_method=args.action_injection_method,
+            action_metadata_path=action_metadata_path,
+            action_metadata_key=args.action_metadata_key,
+            action_normalization_eps=args.action_normalization_eps,
+            action_normalization_mode=args.action_normalization_mode,
+            use_text_condition=args.use_text_condition,
+            text_context_length=args.text_context_length,
+        )
+    accelerator.wait_for_everyone()
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
