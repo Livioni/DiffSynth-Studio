@@ -70,7 +70,24 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     @staticmethod
-    def robot_action_to_tensor(robot):
+    def action_value_to_delta_tensor(value):
+        value = torch.as_tensor(value)
+        if value.ndim == 0:
+            raise ValueError("Robot action values must include a frame dimension.")
+        if value.ndim == 1:
+            value = value.unsqueeze(-1)
+        elif value.ndim > 2:
+            value = value.reshape(value.shape[0], -1)
+
+        # The action embedder shifts actions one frame later, so delta[t]
+        # describes the transition from frame t to frame t + 1.
+        delta = torch.zeros_like(value)
+        if value.shape[0] > 1:
+            delta[:-1] = value[1:] - value[:-1]
+        return delta
+
+    @classmethod
+    def robot_action_to_tensor(cls, robot):
         pieces = []
         for arm in ("left", "right"):
             arm_action = robot.get(arm, {}).get("action", {})
@@ -78,9 +95,7 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
                 value = arm_action.get(key)
                 if value is None:
                     continue
-                if value.ndim == 1:
-                    value = value.unsqueeze(-1)
-                pieces.append(value)
+                pieces.append(cls.action_value_to_delta_tensor(value))
         if len(pieces) == 0:
             return None
         return torch.cat(pieces, dim=-1)

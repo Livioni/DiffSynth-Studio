@@ -17,7 +17,7 @@ num_processes=4  # 启动的训练进程数，通常等于 GPU 数。
 # =========================
 # path
 # =========================
-output_path="./outputs/WanWorldModel_action_additive"  # 模型、日志、评估视频和断点输出目录。
+output_path="./outputs/WanWorldModel_film"  # 模型、日志、评估视频和断点输出目录。
 log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 
 # =========================
@@ -26,7 +26,7 @@ log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 dataset_base_path="world_model_data/robotwin_aloha"  # 训练数据根目录。
 dataset_metadata_path=""  # unified 数据集 metadata 路径；world_model 模式通常留空。
 dataset_type="world_model"  # 数据集类型：auto、unified 或 world_model。
-dataset_repeat=10  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
+dataset_repeat=5  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
 dataset_num_workers=0  # 训练 DataLoader worker 数。
 data_file_keys="video"  # unified 数据集读取的数据字段，world_model 模式基本不使用。
 
@@ -36,10 +36,10 @@ data_file_keys="video"  # unified 数据集读取的数据字段，world_model �
 world_model_tasks=""  # 只加载指定 task，逗号分隔；留空表示加载全部 task。
 world_model_cameras=""  # 要加载的 camera 列表，逗号分隔；留空只加载 video camera。
 world_model_video_camera="head_camera"  # 作为训练视频输入的 camera。
-world_model_stride=""  # 固定长度窗口滑动步长；留空默认等于 num_frames。
+world_model_stride="12"  # 固定长度窗口滑动步长；留空默认等于 num_frames。
 world_model_include_depth=false  # 是否额外加载 depth。
 world_model_include_camera_params=false  # 是否额外加载相机内外参。
-world_model_include_failed=false  # 是否包含失败 episode。
+world_model_include_failed=true  # 是否包含失败 episode。
 
 # =========================
 # video size / sampling
@@ -78,7 +78,7 @@ lr_scheduler="warmup_cosine"  # 学习率调度：constant 或 warmup_cosine。
 lr_warmup_steps=1000  # 线性 warmup step 数。
 lr_cosine_min_ratio=0.1  # cosine decay 最终学习率比例。
 weight_decay=0.01  # AdamW 权重衰减。
-num_epochs=1  # 训练 epoch 数。
+num_epochs=5  # 训练 epoch 数。
 customized_optimizer=""  # 自定义 optimizer 类路径，如 bitsandbytes.optim.Adam8bit。
 find_unused_parameters=true  # DDP 是否查找未使用参数。
 log_steps=10  # 每隔多少 step 记录训练 loss/lr；<=0 表示每 step。
@@ -97,7 +97,7 @@ min_timestep_boundary=0.0  # 采样 timestep 下边界比例。
 # =========================
 action_dim=14  # 机器人 action 向量维度；设空会禁用 action 条件。
 action_embedder_hidden_dim=""  # action embedder 隐藏层维度；留空使用 DiT hidden dim。
-action_injection_method="additive"  # action 注入方式：none/context/additive/cross_attention/adaln/film。
+action_injection_method="film"  # action 注入方式：none/context/additive/cross_attention/adaln/film。
 action_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # action 归一化统计 metadata 路径。
 action_metadata_key="robot_statistics"  # metadata 中 action 统计信息的 key。
 action_normalization_eps=1e-6  # action 归一化 std 的最小值。

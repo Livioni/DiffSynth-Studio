@@ -290,6 +290,14 @@ class DiTBlock(nn.Module):
             self.action_norm = nn.LayerNorm(self.dim, eps=self.eps, elementwise_affine=False)
             self.action_cross_attn = ActionCrossAttention(self.dim, self.num_heads, self.eps)
             self.action_cross_attn.to(dtype=self.modulation.dtype, device=self.modulation.device)
+        if method == "film" and not hasattr(self, "film_modulation"):
+            self.film_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.dim, self.dim * 2, bias=True),
+            )
+            nn.init.constant_(self.film_modulation[-1].weight, 0)
+            nn.init.constant_(self.film_modulation[-1].bias, 0)
+            self.film_modulation.to(dtype=self.modulation.dtype, device=self.modulation.device)
 
     def _validate_token_action(self, action_emb, x, expected_dim):
         if action_emb.shape[1] != x.shape[1]:
@@ -346,8 +354,9 @@ class DiTBlock(nn.Module):
                 self.configure_action_injection(method)
             x = x + self.action_cross_attn(self.action_norm(x), action_emb)
         if action_emb is not None and method == "film":
-            self._validate_token_action(action_emb, x, self.dim * 2)
-            gamma, beta = action_emb.chunk(2, dim=-1)
+            self._validate_token_action(action_emb, x, self.dim)
+            self.film_modulation.to(dtype=x.dtype, device=x.device)
+            gamma, beta = self.film_modulation(action_emb).chunk(2, dim=-1)
             x = (1 + gamma) * x + beta
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -539,7 +548,7 @@ class WanModel(torch.nn.Module):
         if method in ("additive", "cross_attention"):
             return self.dim
         if method == "film":
-            return self.dim * 2
+            return self.dim
         if method == "adaln":
             return self.dim * 6
         return None
