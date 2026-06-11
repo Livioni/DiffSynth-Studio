@@ -1306,7 +1306,7 @@ def prepare_wan_action_condition(
             action_emb.transpose(1, 2).float(),
             size=frame_count,
             mode=interp_mode,
-            align_corners=False if interp_mode == "linear" else None,
+            align_corners=True if interp_mode == "linear" else None,
         ).transpose(1, 2).to(dtype=interp_dtype)
 
     if method == "cross_attention":

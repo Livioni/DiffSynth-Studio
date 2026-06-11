@@ -86,7 +86,7 @@ log_steps=10  # 每隔多少 step 记录训练 loss/lr；<=0 表示每 step。
 # =========================
 # gradient
 # =========================
-gradient_accumulation_steps=1  # 梯度累积步数。
+gradient_accumulation_steps=2  # 梯度累积步数。
 use_gradient_checkpointing=true  # 是否启用梯度检查点以省显存。
 use_gradient_checkpointing_offload=false  # 是否把梯度检查点相关数据 offload 到 CPU。
 max_timestep_boundary=1.0  # 采样 timestep 上边界比例。

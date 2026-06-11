@@ -199,12 +199,12 @@ def print_world_model_training_dataset_summary(dataset, accelerator, label):
             f"samples_per_epoch_after_repeat={row['effective_samples']}"
         )
     print(f"[WorldModelTrainingDataset:{label}] episode sample counts:")
-    for row in stats["episode_rows"]:
-        print(
-            f"  {row['name']}: frames={row['frames']}, "
-            f"unique_samples/windows={row['unique_samples']}, "
-            f"samples_per_epoch_after_repeat={row['effective_samples']}"
-        )
+    # for row in stats["episode_rows"]:
+    #     print(
+    #         f"  {row['name']}: frames={row['frames']}, "
+    #         f"unique_samples/windows={row['unique_samples']}, "
+    #         f"samples_per_epoch_after_repeat={row['effective_samples']}"
+    #     )
 
 
 def build_unified_dataset(args):
