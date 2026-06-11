@@ -53,12 +53,12 @@ class SwanLabLogger:
 
 
 class WandbLogger:
-    def __init__(self, project_name="DiffSynth-Studio", log_dir=None):
+    def __init__(self, project_name="DiffSynth-Studio", log_dir=None, run_name=None):
         import wandb
         project_name = os.environ.get("WANDB_PROJECT", project_name)
         self.wandb = wandb
-        self.run = self.wandb.init(project=project_name, dir=log_dir)
-        print(f"Wandb is enabled. Project: {project_name}")
+        self.run = self.wandb.init(project=project_name, dir=log_dir, name=run_name)
+        print(f"Wandb is enabled. Project: {project_name}; Run: {run_name}")
 
     def log(self, key, value, step):
         self.wandb.log({key: value}, step=step)
@@ -98,7 +98,8 @@ class ModelLogger:
         if self.enable_swanlab_log:
             self.loggers.append(SwanLabLogger(project_name=self.swanlab_project, log_dir=os.path.join(self.output_path, "swanlab_log")))
         if self.enable_wandb_log:
-            self.loggers.append(WandbLogger(project_name=self.wandb_project, log_dir=os.path.join(self.output_path, "wandb_log")))
+            wandb_run_name = os.path.basename(os.path.normpath(self.output_path))
+            self.loggers.append(WandbLogger(project_name=self.wandb_project, log_dir=os.path.join(self.output_path, "wandb_log"), run_name=wandb_run_name))
         self.loggers_initialized = True
 
     def ensure_loggers_initialized(self):

@@ -17,6 +17,10 @@ from diffsynth.core.data.operators import ImageCropAndResize
 from diffsynth.diffusion import *
 from diffsynth.models.wan_video_dit import normalize_action_injection_method
 from diffsynth.pipelines.wan_world_model import ModelConfig, WanWorldModelPipeline
+try:
+    from examples.wanworldmodel.action_utils import robot_action_to_tensor
+except ModuleNotFoundError:
+    from action_utils import robot_action_to_tensor
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -137,37 +141,6 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
                 continue
         return None
 
-    @staticmethod
-    def action_value_to_delta_tensor(value):
-        value = torch.as_tensor(value)
-        if value.ndim == 0:
-            raise ValueError("Robot action values must include a frame dimension.")
-        if value.ndim == 1:
-            value = value.unsqueeze(-1)
-        elif value.ndim > 2:
-            value = value.reshape(value.shape[0], -1)
-
-        # The action embedder shifts actions one frame later, so delta[t]
-        # describes the transition from frame t to frame t + 1.
-        delta = torch.zeros_like(value)
-        if value.shape[0] > 1:
-            delta[:-1] = value[1:] - value[:-1]
-        return delta
-
-    @classmethod
-    def robot_action_to_tensor(cls, robot):
-        pieces = []
-        for arm in ("left", "right"):
-            arm_action = robot.get(arm, {}).get("action", {})
-            for key in ("arm_joint", "gripper"):
-                value = arm_action.get(key)
-                if value is None:
-                    continue
-                pieces.append(cls.action_value_to_delta_tensor(value))
-        if len(pieces) == 0:
-            return None
-        return torch.cat(pieces, dim=-1)
-
     def __getitem__(self, index):
         data = self.dataset[index]
         if self.video_camera not in data["cameras"]:
@@ -180,7 +153,7 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             video = [self.frame_processor(frame) for frame in video]
         data["video"] = video
         data["input_image"] = video[0]
-        action = self.robot_action_to_tensor(data["robot"])
+        action = robot_action_to_tensor(data["robot"])
         if action is not None:
             data["action"] = action
         return data
@@ -394,6 +367,7 @@ class WanWorldModelEvalCallback:
         num_inference_steps=50,
         num_workers=0,
         num_videos_to_log=4,
+        upload_video_steps=None,
         video_fps=4,
         metric_batch_size=4,
         output_path="./models",
@@ -402,6 +376,7 @@ class WanWorldModelEvalCallback:
         self.eval_steps = int(eval_steps)
         self.num_inference_steps = int(num_inference_steps)
         self.num_videos_to_log = int(num_videos_to_log)
+        self.upload_video_steps = self.eval_steps if upload_video_steps is None else int(upload_video_steps)
         self.video_fps = int(video_fps)
         self.metric_batch_size = int(metric_batch_size)
         self.output_path = output_path
@@ -416,6 +391,9 @@ class WanWorldModelEvalCallback:
 
     def should_run(self, step):
         return self.eval_steps > 0 and step > 0 and step % self.eval_steps == 0
+
+    def should_upload_videos(self, step):
+        return self.upload_video_steps > 0 and step > 0 and step % self.upload_video_steps == 0
 
     def _ensure_metrics(self, device):
         if self.lpips_metric is None:
@@ -451,7 +429,7 @@ class WanWorldModelEvalCallback:
         )
         return pipe.vae_output_to_video(decoded)
 
-    def _evaluate_sample(self, pipe, data, sample_id, step, video_paths):
+    def _evaluate_sample(self, pipe, data, sample_id, step, video_paths, upload_videos):
         x_gt = data["video"]
         target_height, target_width, target_num_frames = pipe.check_resize_height_width(
             x_gt[0].size[1],
@@ -478,9 +456,8 @@ class WanWorldModelEvalCallback:
         )
         if len(x_pred) > 0 and x_pred[0].size != x_gt[0].size:
             x_gt = resize_pil_video(x_gt, x_pred[0].size[0], x_pred[0].size[1])
-        x_reconst = self._reconstruct_video(pipe, x_gt)
-
-        if sample_id < self.num_videos_to_log:
+        if upload_videos and sample_id < self.num_videos_to_log:
+            x_reconst = self._reconstruct_video(pipe, x_gt)
             sample_dir = os.path.join(self.output_path, "eval_videos", f"step-{step}", f"sample_{sample_id}")
             paths = {
                 f"val_vis/sample_{sample_id}/x_gt": os.path.join(sample_dir, "x_gt.mp4"),
@@ -539,6 +516,7 @@ class WanWorldModelEvalCallback:
         pred_tensors = []
         gt_tensors = []
         video_paths = {}
+        upload_videos = self.should_upload_videos(step)
 
         try:
             pipe.units = getattr(training_module, "inference_units", pipe.units)
@@ -551,6 +529,7 @@ class WanWorldModelEvalCallback:
                         sample_id,
                         step,
                         video_paths,
+                        upload_videos,
                     )
                     pred_frames.extend(pred_metric_frames)
                     gt_frames.extend(gt_metric_frames)
@@ -566,7 +545,8 @@ class WanWorldModelEvalCallback:
                 )
                 print(f"[Eval step {step}] " + ", ".join(f"{key}={value:.6f}" for key, value in metrics.items()))
                 model_logger.log_metrics(metrics, step=step)
-                model_logger.log_videos(video_paths, step=step, fps=self.video_fps)
+                if video_paths:
+                    model_logger.log_videos(video_paths, step=step, fps=self.video_fps)
         finally:
             pipe.units = training_units
             for module, training in module_modes:
@@ -702,7 +682,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
                 # Wan2.2-TI2V-5B 的 I2V 条件直接取训练视频首帧，不要求 metadata 单独提供 image。
                 inputs_shared["input_image"] = data["video"][0]
             elif extra_input == "action" and "action" not in data and "robot" in data:
-                inputs_shared["action"] = WorldModelTrainingDataset.robot_action_to_tensor(data["robot"])
+                inputs_shared["action"] = robot_action_to_tensor(data["robot"])
             else:
                 inputs_shared[extra_input] = data[extra_input]
         return inputs_shared
@@ -788,6 +768,7 @@ def wan_world_model_parser():
     parser.add_argument("--eval_max_samples", type=int, default=2, help="Maximum eval windows to run. Defaults to all eval windows.")
     parser.add_argument("--eval_dataset_num_workers", type=int, default=0, help="Number of workers for eval data loading.")
     parser.add_argument("--eval_num_videos_to_log", type=int, default=4, help="Number of eval samples whose videos are logged.")
+    parser.add_argument("--upload_video_steps", type=int, default=None, help="Upload eval videos every N training steps. Defaults to eval_steps. Set <= 0 to disable video uploads.")
     parser.add_argument("--eval_video_fps", type=int, default=4, help="FPS for logged eval videos.")
     parser.add_argument("--eval_metric_batch_size", type=int, default=4, help="Batch size for LPIPS/FID metric models.")
 
@@ -960,6 +941,7 @@ if __name__ == "__main__":
             num_inference_steps=args.eval_num_inference_steps,
             num_workers=args.eval_dataset_num_workers,
             num_videos_to_log=args.eval_num_videos_to_log,
+            upload_video_steps=args.upload_video_steps,
             video_fps=args.eval_video_fps,
             metric_batch_size=args.eval_metric_batch_size,
             output_path=args.output_path,

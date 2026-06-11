@@ -17,7 +17,7 @@ num_processes=6   # 启动的训练进程数，通常等于 GPU 数。
 # =========================
 # path
 # =========================
-output_path="./outputs/WanWorldModel_film_no_language"  # 模型、日志、评估视频和断点输出目录。
+output_path="./outputs/WanWorldModel_film_no_language_abs_action"  # 模型、日志、评估视频和断点输出目录。
 log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 
 # =========================
@@ -26,7 +26,7 @@ log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/robotwin_aloha_fail"  # 训练数据根目录，多个 root 用逗号分隔。
 dataset_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # unified 数据集 metadata 路径；world_model 模式通常留空。
 dataset_type="world_model"  # 数据集类型：auto、unified 或 world_model。
-dataset_repeat=5  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
+dataset_repeat=3  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
 dataset_num_workers=0  # 训练 DataLoader worker 数。
 data_file_keys="video"  # unified 数据集读取的数据字段，world_model 模式基本不使用。
 
@@ -36,7 +36,7 @@ data_file_keys="video"  # unified 数据集读取的数据字段，world_model �
 world_model_tasks=""  # 只加载指定 task，逗号分隔；留空表示加载全部 task。
 world_model_cameras=""  # 要加载的 camera 列表，逗号分隔；留空只加载 video camera。
 world_model_video_camera="head_camera"  # 作为训练视频输入的 camera。
-world_model_stride="12"  # 固定长度窗口滑动步长；留空默认等于 num_frames。
+world_model_stride="6"  # 固定长度窗口滑动步长；留空默认等于 num_frames。
 world_model_include_depth=false  # 是否额外加载 depth。
 world_model_include_camera_params=false  # 是否额外加载相机内外参。
 world_model_include_failed=true  # 是否包含失败 episode。
@@ -44,7 +44,7 @@ world_model_include_failed=true  # 是否包含失败 episode。
 # =========================
 # video size / sampling
 # =========================
-height=240  # 训练视频帧高度；留空启用动态分辨率。
+height=256  # 训练视频帧高度；留空启用动态分辨率。
 width=320  # 训练视频帧宽度；留空启用动态分辨率。
 max_pixels=1048576  # 动态分辨率时每帧最大像素数。
 num_frames=25  # 每个训练视频 window 的帧数。
@@ -113,7 +113,8 @@ action_normalization_mode="standard"  # action 归一化模式：standard=(actio
 # eval
 # =========================
 eval_dataset_base_path="world_model_data/robotwin_aloha/val_set"  # 评估数据根目录；设空跳过 eval dataset。
-eval_steps=2000  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
+eval_steps=100  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
+upload_video_steps=1000 #每隔多少 step 上传videos到日志平台；<=0 禁止上传。
 eval_num_inference_steps=50  # eval 推理的 diffusion steps。
 eval_max_samples=4  # eval 最多评估多少个 window。
 eval_dataset_num_workers=0  # eval DataLoader worker 数。
@@ -254,6 +255,7 @@ add_arg --action_normalization_mode "${action_normalization_mode}"
 # Eval
 add_arg --eval_dataset_base_path "${eval_dataset_base_path}"
 add_arg --eval_steps "${eval_steps}"
+add_arg --upload_video_steps "${upload_video_steps}"
 add_arg --eval_num_inference_steps "${eval_num_inference_steps}"
 add_arg --eval_max_samples "${eval_max_samples}"
 add_arg --eval_dataset_num_workers "${eval_dataset_num_workers}"

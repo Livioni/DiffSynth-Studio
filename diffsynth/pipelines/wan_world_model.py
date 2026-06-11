@@ -521,7 +521,7 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
                 action_emb[:, :-1],
             ],
             dim=1,
-        ) #第一帧没有到这张图的action
+        ) # 第一帧无动作；后续帧使用上一帧原始 action 作为条件。
 
         if action_emb.shape[0] != context.shape[0]:
             if action_emb.shape[0] == 1:

@@ -4,6 +4,11 @@ import json
 import os
 import re
 
+try:
+    from examples.wanworldmodel.action_utils import robot_action_to_tensor
+except ModuleNotFoundError:
+    from action_utils import robot_action_to_tensor
+
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("DIFFSYNTH_MODEL_BASE_PATH", os.path.abspath("models"))
@@ -69,26 +74,6 @@ def infer_action_embedder_config(checkpoint_path):
                 hidden_dim, action_dim = handle.get_slice(key).get_shape()
                 return int(action_dim), int(hidden_dim)
     return None, None
-
-
-def robot_action_to_tensor(robot):
-    import torch
-
-    pieces = []
-    for arm in ("left", "right"):
-        arm_action = robot.get(arm, {}).get("action", {})
-        for key in ("arm_joint", "gripper"):
-            value = arm_action.get(key)
-            if value is None:
-                continue
-            if not torch.is_tensor(value):
-                value = torch.as_tensor(value)
-            if value.ndim == 1:
-                value = value.unsqueeze(-1)
-            pieces.append(value)
-    if len(pieces) == 0:
-        return None
-    return torch.cat(pieces, dim=-1)
 
 
 def save_pil_video(video, path, fps=4):
@@ -419,7 +404,7 @@ def run(args):
 def build_parser():
     parser = argparse.ArgumentParser(description="Run WanWorldModel inference on a selected eval dataset window.")
 
-    parser.add_argument("--eval_dataset_base_path", type=str, default="world_model_data/robotwin_aloha_testset/custom_aloha_2ep_clean")
+    parser.add_argument("--eval_dataset_base_path", type=str, default="world_model_data/robotwin_aloha/val_set")
     parser.add_argument("--task", type=str, default="adjust_bottle", help="Eval task folder. Defaults to the first indexed task.")
     parser.add_argument("--episode", type=str, default="episode0", help="Episode name, e.g. episode0. Defaults to the first episode for the task.")
     parser.add_argument("--start_frame", type=int, default=0, help="Start frame of the eval window.")
@@ -427,13 +412,13 @@ def build_parser():
     parser.add_argument("--include_failed", default=False, action="store_true")
     parser.add_argument("--list_samples", default=False, action="store_true", help="List task/episode/start ranges and exit.")
 
-    parser.add_argument("--height", type=int, default=240)
+    parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--num_frames", type=int, default=25)
     parser.add_argument("--fps", type=int, default=4)
 
-    parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_action_additive/step-30000.safetensors")
+    parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_film_no_language/step-20000.safetensors")
     parser.add_argument("--output_dir", type=str, default="outputs/inference")
     parser.add_argument("--dit_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors")
     parser.add_argument("--text_encoder_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/models_t5_umt5-xxl-enc-bf16.safetensors")
@@ -444,9 +429,15 @@ def build_parser():
         "--disable_language_condition",
         "--no_language_condition",
         dest="use_text_condition",
-        default=True,
+        default=False,
         action="store_false",
         help="Disable prompt/language conditioning. The pipeline skips context attention and does not load the text encoder/tokenizer.",
+    )
+    parser.add_argument(
+        "--enable_language_condition",
+        dest="use_text_condition",
+        action="store_true",
+        help="Enable prompt/language conditioning for checkpoints trained with text context.",
     )
     parser.add_argument(
         "--text_context_length",
@@ -460,10 +451,10 @@ def build_parser():
     parser.add_argument(
         "--action_injection_method",
         type=str,
-        default="additive",
+        default="film",
         choices=("none", "context", "additive", "cross_attention", "cross-attention", "adaln", "film"),
     )
-    parser.add_argument("--action_metadata_path", type=str, default="world_model_data/robotwin_aloha_testset/custom_aloha_2ep_clean/metadata.json")
+    parser.add_argument("--action_metadata_path", type=str, default="world_model_data/robotwin_aloha/metadata.json")
     parser.add_argument("--action_metadata_key", type=str, default="robot_statistics")
     parser.add_argument("--action_normalization_eps", type=float, default=1e-6)
     parser.add_argument(
