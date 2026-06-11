@@ -435,7 +435,7 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
-            input_params=("action", "latents"),
+            input_params=("action", "num_frames"),
             input_params_posi={"context": "context"},
             input_params_nega={"context": "context"},
             output_params=("context", "action_emb"),
@@ -533,17 +533,26 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
         previous_action_positions = video_positions[1:] - 1.0
         return cls._sample_action_at_positions(action[:, :-1], previous_action_positions)
 
+    @staticmethod
+    def _latent_frame_count(num_frames: int):
+        num_frames = int(num_frames)
+        if num_frames <= 0:
+            raise ValueError(f"`num_frames` must be positive, got {num_frames}.")
+        return (num_frames - 1) // 4 + 1
+
     @classmethod
     def _embed_latent_aligned_action(cls, pipe: WanWorldModelPipeline, action: torch.Tensor, frame_count: int):
         if frame_count <= 0:
             raise ValueError(f"`frame_count` must be positive, got {frame_count}.")
 
         if frame_count == 1 or action.shape[1] <= 1:
-            reference_action = action[:, :1]
+            reference_action = action[:, :1].to(dtype=pipe.torch_dtype)
             reference_emb = pipe.action_embedder(reference_action)
             return reference_emb.new_zeros(action.shape[0], frame_count, reference_emb.shape[-1])
 
-        action_tail = cls._resample_previous_action_for_latents(action, frame_count)
+        with torch.no_grad():
+            action_tail = cls._resample_previous_action_for_latents(action, frame_count)
+            action_tail = action_tail.to(dtype=pipe.torch_dtype)
         action_tail_emb = pipe.action_embedder(action_tail)
         return torch.cat(
             [
@@ -553,7 +562,7 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
             dim=1,
         )
 
-    def process(self, pipe: WanWorldModelPipeline, action, latents, context) -> dict:
+    def process(self, pipe: WanWorldModelPipeline, action, num_frames, context) -> dict:
         if action is None:
             return {}
         injection_method = normalize_action_injection_method(pipe.action_injection_method)
@@ -565,7 +574,7 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
         action = self._prepare_action(action).to(device=pipe.device)
         if action.shape[-1] != pipe.action_dim:
             raise ValueError(f"`action` last dimension is {action.shape[-1]}, but pipeline action_dim is {pipe.action_dim}.")
-        action = self._normalize_action(pipe, action).to(dtype=pipe.torch_dtype)
+        action = self._normalize_action(pipe, action)
 
         if action.shape[0] != context.shape[0]:
             if action.shape[0] == 1:
@@ -579,14 +588,14 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
 
         pipe.action_embedder.to(dtype=pipe.torch_dtype, device=pipe.device)
         if injection_method != "context":
-            if latents is None:
-                raise ValueError("Latents must be available before latent-frame action conditioning.")
-            action_emb = self._embed_latent_aligned_action(pipe, action, int(latents.shape[2]))
+            frame_count = self._latent_frame_count(num_frames)
+            action_emb = self._embed_latent_aligned_action(pipe, action, frame_count)
             return {
                 "context": context,
                 "action_emb": action_emb,
             }
 
+        action = action.to(dtype=pipe.torch_dtype)
         action_emb = pipe.action_embedder(action)
         action_emb = torch.cat(
             [
