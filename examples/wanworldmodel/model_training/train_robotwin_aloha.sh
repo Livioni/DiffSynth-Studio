@@ -13,6 +13,9 @@ export TOKENIZERS_PARALLELISM=false
 # accelerate
 # =========================
 num_processes=4  # 启动的训练进程数，通常等于 GPU 数。
+num_machines=1  # 单机训练。
+mixed_precision="bf16"  # accelerate 混合精度模式；bf16 避免裸 bf16 参数训练路径。
+dynamo_backend="no"  # 不启用 torch dynamo。
 
 # =========================
 # path
@@ -166,6 +169,9 @@ mkdir -p "${output_path}"
 
 accelerate_args=(
   --num_processes "${num_processes}"
+  --num_machines "${num_machines}"
+  --mixed_precision "${mixed_precision}"
+  --dynamo_backend "${dynamo_backend}"
 )
 
 train_args=(
