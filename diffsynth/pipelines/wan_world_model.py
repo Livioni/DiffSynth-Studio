@@ -540,27 +540,33 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
             raise ValueError(f"`num_frames` must be positive, got {num_frames}.")
         return (num_frames - 1) // 4 + 1
 
+    @staticmethod
+    def _action_embedder_dtype(pipe: WanWorldModelPipeline):
+        return next(pipe.action_embedder.parameters(), torch.empty((), dtype=pipe.torch_dtype)).dtype
+
     @classmethod
     def _embed_latent_aligned_action(cls, pipe: WanWorldModelPipeline, action: torch.Tensor, frame_count: int):
         if frame_count <= 0:
             raise ValueError(f"`frame_count` must be positive, got {frame_count}.")
 
+        embedder_dtype = cls._action_embedder_dtype(pipe)
         if frame_count == 1 or action.shape[1] <= 1:
-            reference_action = action[:, :1].to(dtype=pipe.torch_dtype)
+            reference_action = action[:, :1].to(dtype=embedder_dtype)
             reference_emb = pipe.action_embedder(reference_action)
-            return reference_emb.new_zeros(action.shape[0], frame_count, reference_emb.shape[-1])
+            return reference_emb.new_zeros(action.shape[0], frame_count, reference_emb.shape[-1]).to(dtype=pipe.torch_dtype)
 
         with torch.no_grad():
             action_tail = cls._resample_previous_action_for_latents(action, frame_count)
-            action_tail = action_tail.to(dtype=pipe.torch_dtype)
+            action_tail = action_tail.to(dtype=embedder_dtype)
         action_tail_emb = pipe.action_embedder(action_tail)
-        return torch.cat(
+        action_emb = torch.cat(
             [
                 action_tail_emb.new_zeros(action_tail_emb.shape[0], 1, action_tail_emb.shape[-1]),
                 action_tail_emb,
             ],
             dim=1,
         )
+        return action_emb.to(dtype=pipe.torch_dtype)
 
     def process(self, pipe: WanWorldModelPipeline, action, num_frames, context) -> dict:
         if action is None:
@@ -586,7 +592,7 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
                     f"Action batch size {action.shape[0]} does not match context batch size {context.shape[0]}."
                 )
 
-        pipe.action_embedder.to(dtype=pipe.torch_dtype, device=pipe.device)
+        pipe.action_embedder.to(device=pipe.device)
         if injection_method != "context":
             frame_count = self._latent_frame_count(num_frames)
             action_emb = self._embed_latent_aligned_action(pipe, action, frame_count)
@@ -595,7 +601,7 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
                 "action_emb": action_emb,
             }
 
-        action = action.to(dtype=pipe.torch_dtype)
+        action = action.to(dtype=self._action_embedder_dtype(pipe))
         action_emb = pipe.action_embedder(action)
         action_emb = torch.cat(
             [
