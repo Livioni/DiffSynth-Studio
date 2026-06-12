@@ -1,4 +1,4 @@
-import json, math, os, torch, importlib
+import json, math, os, shutil, torch, importlib
 from tqdm import tqdm
 from accelerate import Accelerator
 try:
@@ -229,6 +229,7 @@ def save_training_checkpoint(
     batch_id: int,
     batches_per_epoch: int,
     num_epochs: int,
+    keep_latest_checkpoint_only: bool = False,
 ):
     checkpoint_root = get_training_checkpoint_root(output_path, training_checkpoint_dir)
     checkpoint_dir = os.path.join(checkpoint_root, f"step-{global_step}")
@@ -255,7 +256,23 @@ def save_training_checkpoint(
         os.makedirs(checkpoint_root, exist_ok=True)
         with open(os.path.join(checkpoint_root, LATEST_TRAINING_CHECKPOINT_FILE), "w") as f:
             f.write(os.path.abspath(checkpoint_dir))
+        if keep_latest_checkpoint_only:
+            cleanup_old_training_checkpoints(checkpoint_root, checkpoint_dir)
     accelerator.wait_for_everyone()
+
+
+def cleanup_old_training_checkpoints(checkpoint_root, keep_checkpoint_dir):
+    keep_checkpoint_dir = os.path.abspath(keep_checkpoint_dir)
+    for name in os.listdir(checkpoint_root):
+        if not name.startswith("step-"):
+            continue
+        path = os.path.abspath(os.path.join(checkpoint_root, name))
+        if path == keep_checkpoint_dir or not os.path.isdir(path):
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as error:
+            print(f"Warning: failed to remove old training checkpoint {path}: {error}")
 
 
 def load_training_checkpoint(
@@ -300,6 +317,7 @@ def launch_training_task(
     lr_scheduler: str = "constant",
     lr_warmup_steps: int = 0,
     lr_cosine_min_ratio: float = 1.0,
+    keep_latest_checkpoint_only: bool = False,
     args = None,
     **kwargs,
 ):
@@ -320,6 +338,7 @@ def launch_training_task(
         lr_scheduler = getattr(args, "lr_scheduler", lr_scheduler)
         lr_warmup_steps = getattr(args, "lr_warmup_steps", lr_warmup_steps)
         lr_cosine_min_ratio = getattr(args, "lr_cosine_min_ratio", lr_cosine_min_ratio)
+        keep_latest_checkpoint_only = getattr(args, "keep_latest_checkpoint_only", keep_latest_checkpoint_only)
 
     should_save_training_checkpoint = save_training_checkpoint_enabled and save_steps is not None and save_steps > 0
     if (should_save_training_checkpoint or resume_training_checkpoint is not None) and enable_model_cpu_offload:
@@ -436,6 +455,7 @@ def launch_training_task(
                         batch_id,
                         batches_per_epoch,
                         num_epochs,
+                        keep_latest_checkpoint_only=keep_latest_checkpoint_only,
                     )
                 if eval_callback is not None and eval_callback.should_run(model_logger.num_steps):
                     accelerator.wait_for_everyone()

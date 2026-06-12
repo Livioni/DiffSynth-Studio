@@ -20,7 +20,7 @@ dynamo_backend="no"  # 不启用 torch dynamo。
 # =========================
 # path
 # =========================
-output_path="./outputs/WanWorldModel_film_no_language_abs_action"  # 模型、日志、评估视频和断点输出目录。
+output_path="./outputs/WanWorldModel_film_no_language_abs_action_fix"  # 模型、日志、评估视频和断点输出目录。
 log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 
 # =========================
@@ -129,7 +129,8 @@ eval_metric_batch_size=4  # LPIPS/FID 计算 batch size。
 # output / checkpoints
 # =========================
 remove_prefix_in_ckpt="pipe.dit."  # 保存训练权重时移除的 state_dict key 前缀。
-save_steps=20000  # 每隔多少 step 保存权重和完整训练断点；留空则按 epoch 保存权重。
+save_steps=10000  # 每隔多少 step 保存权重和完整训练断点；留空则按 epoch 保存权重。
+keep_latest_checkpoint_only=true  # 每次保存后只保留最新的 step/epoch 权重和完整训练断点。
 save_training_checkpoint=true  # 是否在 save_steps 时保存 optimizer/scheduler/RNG/global step 等完整断点。
 resume_training_checkpoint=""  # 从完整训练断点恢复；可填 latest 或 step 目录。
 training_checkpoint_dir=""  # 完整训练断点目录；留空默认 output_path/training_checkpoints。
@@ -273,6 +274,7 @@ add_arg --eval_metric_batch_size "${eval_metric_batch_size}"
 add_arg --output_path "${output_path}"
 add_arg --remove_prefix_in_ckpt "${remove_prefix_in_ckpt}"
 add_optional_arg --save_steps "${save_steps}"
+add_flag --keep_latest_checkpoint_only "${keep_latest_checkpoint_only}"
 add_inverse_flag --disable_training_checkpoint "${save_training_checkpoint}"
 add_optional_arg --resume_training_checkpoint "${resume_training_checkpoint}"
 add_optional_arg --training_checkpoint_dir "${training_checkpoint_dir}"

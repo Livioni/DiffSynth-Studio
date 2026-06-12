@@ -78,11 +78,13 @@ class ModelLogger:
         enable_tensorboard_log=True,
         enable_swanlab_log=False, swanlab_project="DiffSynth-Studio",
         enable_wandb_log=False, wandb_project="DiffSynth-Studio",
+        keep_latest_checkpoint_only=False,
     ):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
+        self.keep_latest_checkpoint_only = keep_latest_checkpoint_only
         # Loggers
         self.enable_tensorboard_log = enable_tensorboard_log
         self.enable_swanlab_log = enable_swanlab_log
@@ -159,3 +161,21 @@ class ModelLogger:
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+            if self.keep_latest_checkpoint_only:
+                self.cleanup_old_model_checkpoints(path)
+
+    def cleanup_old_model_checkpoints(self, keep_path):
+        keep_path = os.path.abspath(keep_path)
+        for name in os.listdir(self.output_path):
+            if not (
+                (name.startswith("step-") or name.startswith("epoch-"))
+                and name.endswith(".safetensors")
+            ):
+                continue
+            path = os.path.abspath(os.path.join(self.output_path, name))
+            if path == keep_path or not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+            except OSError as error:
+                print(f"Warning: failed to remove old model checkpoint {path}: {error}")

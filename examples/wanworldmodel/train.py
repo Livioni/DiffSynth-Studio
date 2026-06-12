@@ -932,6 +932,7 @@ if __name__ == "__main__":
         swanlab_project=args.swanlab_project,
         enable_wandb_log=args.enable_wandb_log,
         wandb_project=args.wandb_project,
+        keep_latest_checkpoint_only=args.keep_latest_checkpoint_only,
     )
     eval_callback = None
     if eval_dataset is not None:

@@ -297,7 +297,7 @@ class DiTBlock(nn.Module):
             )
             nn.init.constant_(self.film_modulation[-1].weight, 0)
             nn.init.constant_(self.film_modulation[-1].bias, 0)
-            self.film_modulation.to(dtype=self.modulation.dtype, device=self.modulation.device)
+            self.film_modulation.to(device=self.modulation.device)
 
     def _validate_token_action(self, action_emb, x, expected_dim):
         if action_emb.shape[1] != x.shape[1]:
@@ -355,8 +355,10 @@ class DiTBlock(nn.Module):
             x = x + self.action_cross_attn(self.action_norm(x), action_emb)
         if action_emb is not None and method == "film":
             self._validate_token_action(action_emb, x, self.dim)
-            self.film_modulation.to(dtype=x.dtype, device=x.device)
-            gamma, beta = self.film_modulation(action_emb).chunk(2, dim=-1)
+            self.film_modulation.to(device=x.device)
+            film_dtype = self.film_modulation[-1].weight.dtype
+            film_mod = self.film_modulation(action_emb.to(dtype=film_dtype)).to(dtype=x.dtype)
+            gamma, beta = film_mod.chunk(2, dim=-1)
             x = (1 + gamma) * x + beta
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
