@@ -43,6 +43,10 @@ world_model_stride="6"  # 固定长度窗口滑动步长；留空默认等于 nu
 world_model_include_depth=false  # 是否额外加载 depth。
 world_model_include_camera_params=false  # 是否额外加载相机内外参。
 world_model_include_failed=true  # 是否包含失败 episode。
+world_model_filter_static_action_windows=true  # 是否过滤 action 完全不变的 window。
+world_model_static_action_eps=1e-8  # 判定 action 完全不变的 normalized delta max 阈值。
+world_model_action_delta_low_threshold=0.02  # 低 action 变化 window 的 normalized delta mean 阈值。
+world_model_action_delta_low_weight=0.2  # 低 action 变化 window 的采样权重。
 
 # =========================
 # video size / sampling
@@ -116,10 +120,10 @@ action_normalization_mode="standard"  # action 归一化模式：standard=(actio
 # eval
 # =========================
 eval_dataset_base_path="world_model_data/robotwin_aloha/val_set"  # 评估数据根目录；设空跳过 eval dataset。
-eval_steps=100  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
+eval_steps=200  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
 upload_video_steps=1000 #每隔多少 step 上传videos到日志平台；<=0 禁止上传。
 eval_num_inference_steps=50  # eval 推理的 diffusion steps。
-eval_max_samples=4  # eval 最多评估多少个 window。
+eval_max_samples=32  # eval 最多评估多少个 window。
 eval_dataset_num_workers=0  # eval DataLoader worker 数。
 eval_num_videos_to_log=4  # 记录到日志平台的 eval 样本视频数量。
 eval_video_fps=4  # eval 视频保存和日志展示 FPS。
@@ -202,6 +206,10 @@ add_optional_arg --world_model_stride "${world_model_stride}"
 add_flag --world_model_include_depth "${world_model_include_depth}"
 add_flag --world_model_include_camera_params "${world_model_include_camera_params}"
 add_flag --world_model_include_failed "${world_model_include_failed}"
+add_flag --world_model_filter_static_action_windows "${world_model_filter_static_action_windows}"
+add_arg --world_model_static_action_eps "${world_model_static_action_eps}"
+add_optional_arg --world_model_action_delta_low_threshold "${world_model_action_delta_low_threshold}"
+add_arg --world_model_action_delta_low_weight "${world_model_action_delta_low_weight}"
 
 # Video Size / Sampling
 add_optional_arg --height "${height}"

@@ -52,16 +52,21 @@ def contains_cached_data_files(path):
 def default_action_metadata_path(dataset_base_path, metadata_key="robot_statistics"):
     if dataset_base_path is None:
         return None
-    path = os.path.join(dataset_base_path, "metadata.json")
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r") as f:
-            metadata = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(metadata, dict) and (metadata_key in metadata or "arms" in metadata):
-        return path
+    roots = split_csv(dataset_base_path) or (dataset_base_path,)
+    candidate_paths = []
+    for root in roots:
+        candidate_paths.append(os.path.join(root, "metadata.json"))
+        candidate_paths.append(os.path.join(os.path.dirname(root), "metadata.json"))
+    for path in candidate_paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                metadata = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata, dict) and (metadata_key in metadata or "arms" in metadata):
+            return path
     return None
 
 
@@ -74,6 +79,10 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+    @property
+    def sample_weights(self):
+        return getattr(self.dataset, "sample_weights", None)
 
     def sample_statistics(self):
         episodes = getattr(self.dataset, "episodes", None)
@@ -126,6 +135,7 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             "episode_count": len(episodes),
             "unique_sample_count": unique_sample_count,
             "effective_sample_count": effective_sample_count,
+            "action_window_quality_stats": getattr(self.dataset, "action_window_quality_stats", None),
             "task_rows": dict(sorted(task_rows.items())),
             "episode_rows": episode_rows,
         }
@@ -191,6 +201,17 @@ def print_world_model_training_dataset_summary(dataset, accelerator, label):
         f"unique_samples/windows={stats['unique_sample_count']}; "
         f"samples_per_epoch_after_repeat={stats['effective_sample_count']}"
     )
+    action_quality = stats.get("action_window_quality_stats")
+    if action_quality is not None and action_quality.get("enabled"):
+        print(
+            f"[WorldModelTrainingDataset:{label}] action_quality="
+            f"total_before_filter={action_quality['total_windows_before_filter']}; "
+            f"filtered_static={action_quality['filtered_static_windows']}; "
+            f"retained={action_quality['retained_windows']}; "
+            f"low_delta_weighted={action_quality['low_delta_weighted_windows']}; "
+            f"low_threshold={action_quality['action_delta_low_threshold']}; "
+            f"low_weight={action_quality['action_delta_low_weight']}"
+        )
     print(f"[WorldModelTrainingDataset:{label}] task sample counts:")
     for task_name, row in stats["task_rows"].items():
         print(
@@ -232,6 +253,10 @@ def build_world_model_dataset(args):
     cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
     if args.world_model_video_camera not in cameras:
         cameras = (args.world_model_video_camera,) + cameras
+    action_metadata_path = args.action_metadata_path or default_action_metadata_path(
+        args.dataset_base_path,
+        metadata_key=args.action_metadata_key,
+    )
     dataset = WorldModelDataset(
         root=args.dataset_base_path,
         tasks=split_csv(args.world_model_tasks),
@@ -242,6 +267,14 @@ def build_world_model_dataset(args):
         include_camera_params=args.world_model_include_camera_params,
         include_failed=args.world_model_include_failed,
         repeat=args.dataset_repeat,
+        action_metadata_path=action_metadata_path,
+        action_metadata_key=args.action_metadata_key,
+        action_normalization_eps=args.action_normalization_eps,
+        action_normalization_mode=args.action_normalization_mode,
+        filter_static_action_windows=args.world_model_filter_static_action_windows,
+        static_action_eps=args.world_model_static_action_eps,
+        action_delta_low_threshold=args.world_model_action_delta_low_threshold,
+        action_delta_low_weight=args.world_model_action_delta_low_weight,
     )
     frame_processor = ImageCropAndResize(
         height=args.height,
@@ -755,6 +788,30 @@ def wan_world_model_parser():
     parser.add_argument("--world_model_include_depth", default=False, action="store_true", help="Load depth arrays from WorldModelDataset.")
     parser.add_argument("--world_model_include_camera_params", default=False, action="store_true", help="Load camera intrinsics/extrinsics from WorldModelDataset.")
     parser.add_argument("--world_model_include_failed", default=False, action="store_true", help="Include failed episodes from WorldModelDataset.")
+    parser.add_argument(
+        "--world_model_filter_static_action_windows",
+        default=False,
+        action="store_true",
+        help="Filter windows whose adjacent-frame action delta is zero within --world_model_static_action_eps.",
+    )
+    parser.add_argument(
+        "--world_model_static_action_eps",
+        type=float,
+        default=1e-8,
+        help="Maximum normalized action delta max used to classify a window as static.",
+    )
+    parser.add_argument(
+        "--world_model_action_delta_low_threshold",
+        type=float,
+        default=None,
+        help="Normalized action delta mean threshold for down-weighting low-motion windows. Leave unset to disable.",
+    )
+    parser.add_argument(
+        "--world_model_action_delta_low_weight",
+        type=float,
+        default=1.0,
+        help="Sampling weight assigned to windows below --world_model_action_delta_low_threshold.",
+    )
 
     # Periodic evaluation.
     parser.add_argument(

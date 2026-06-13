@@ -79,6 +79,33 @@ def get_dataloader_batch_size(dataloader):
     return None if batch_size is None else int(batch_size)
 
 
+def get_dataset_sample_weights(dataset):
+    sample_weights = getattr(dataset, "sample_weights", None)
+    if sample_weights is None:
+        return None
+    sample_weights = list(sample_weights)
+    dataset_length = safe_len(dataset)
+    if dataset_length is not None and len(sample_weights) != dataset_length:
+        raise ValueError(f"Dataset sample_weights length {len(sample_weights)} does not match dataset length {dataset_length}.")
+    if len(sample_weights) == 0:
+        return None
+    return sample_weights
+
+
+def print_weighted_sampler_plan(accelerator: Accelerator, sample_weights):
+    if not accelerator.is_main_process or sample_weights is None:
+        return
+    weights = torch.as_tensor(sample_weights, dtype=torch.float32)
+    print(
+        "[Training sample plan] weighted_sampler=enabled; "
+        f"num_weights={weights.numel()}; "
+        f"min={weights.min().item():.6g}; "
+        f"mean={weights.mean().item():.6g}; "
+        f"max={weights.max().item():.6g}; "
+        f"low_weight_samples={(weights < 1.0).sum().item()}"
+    )
+
+
 def format_rank_allocations(dataset_length, num_processes, sample_slots_per_rank):
     if sample_slots_per_rank is None:
         return ", ".join(f"rank{rank}:unknown" for rank in range(num_processes))
@@ -348,7 +375,17 @@ def launch_training_task(
     optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     prepare_scheduler_with_accelerator = lr_scheduler == "constant"
     scheduler = get_lr_scheduler(optimizer, lr_scheduler) if prepare_scheduler_with_accelerator else None
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    sample_weights = get_dataset_sample_weights(dataset)
+    if sample_weights is None:
+        dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    else:
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        dataloader = torch.utils.data.DataLoader(dataset, sampler=sampler, collate_fn=lambda x: x[0], num_workers=num_workers)
+        print_weighted_sampler_plan(accelerator, sample_weights)
     dataset_length = safe_len(dataset)
     dataloader_batches_before_shard = safe_len(dataloader)
     per_device_batch_size = get_dataloader_batch_size(dataloader) or 1
