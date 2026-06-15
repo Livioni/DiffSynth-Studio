@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_base_path",
         type=str,
-        default="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/robotwin_aloha_fail",
+        default="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/clean_set,world_model_data/robotwin_aloha/fail_set",
         help="Comma-separated RobotWin roots, matching training --dataset_base_path.",
     )
     parser.add_argument("--tasks", type=str, default=None, help="Optional comma-separated task filter.")

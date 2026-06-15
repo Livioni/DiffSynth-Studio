@@ -1,5 +1,11 @@
 # 本地改动备忘录
 
+1. rollout a video
+
+```bash
+python examples/wanworldmodel/rollout.py --task beat_block_hammer --episode episode55 --num_inference_steps 500
+```
+
 ## 常用工作流
 
 1. 生成 robot action 归一化统计：

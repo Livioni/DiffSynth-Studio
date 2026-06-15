@@ -12,7 +12,7 @@ export TOKENIZERS_PARALLELISM=false
 # =========================
 # accelerate
 # =========================
-num_processes=6   # 启动的训练进程数，通常等于 GPU 数。
+num_processes=4   # 启动的训练进程数，通常等于 GPU 数。
 num_machines=1  # 单机训练。
 mixed_precision="bf16"  # accelerate 混合精度模式；bf16 避免裸 bf16 参数训练路径。
 dynamo_backend="no"  # 不启用 torch dynamo。
@@ -20,13 +20,13 @@ dynamo_backend="no"  # 不启用 torch dynamo。
 # =========================
 # path
 # =========================
-output_path="./outputs/WanWorldModel_film_no_language_abs_action_fix"  # 模型、日志、评估视频和断点输出目录。
+output_path="./outputs/WanWorldModel_film_no_language_abs_action_fix_resume2"  # 模型、日志、评估视频和断点输出目录。
 log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 
 # =========================
 # dataset
 # =========================
-dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/robotwin_aloha_fail"  # 训练数据根目录，多个 root 用逗号分隔。
+dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/fail_set,world_model_data/robotwin_aloha/clean_set"  # 训练数据根目录，多个 root 用逗号分隔。
 dataset_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # unified 数据集 metadata 路径；world_model 模式通常留空。
 dataset_type="world_model"  # 数据集类型：auto、unified 或 world_model。
 dataset_repeat=3  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
@@ -120,7 +120,7 @@ action_normalization_mode="standard"  # action 归一化模式：standard=(actio
 # eval
 # =========================
 eval_dataset_base_path="world_model_data/robotwin_aloha/val_set"  # 评估数据根目录；设空跳过 eval dataset。
-eval_steps=200  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
+eval_steps=500  # 每隔多少 step 做一次 eval；<=0 禁用周期 eval。
 upload_video_steps=1000 #每隔多少 step 上传videos到日志平台；<=0 禁止上传。
 eval_num_inference_steps=50  # eval 推理的 diffusion steps。
 eval_max_samples=32  # eval 最多评估多少个 window。
@@ -136,7 +136,7 @@ remove_prefix_in_ckpt="pipe.dit."  # 保存训练权重时移除的 state_dict k
 save_steps=10000  # 每隔多少 step 保存权重和完整训练断点；留空则按 epoch 保存权重。
 keep_latest_checkpoint_only=true  # 每次保存后只保留最新的 step/epoch 权重和完整训练断点。
 save_training_checkpoint=true  # 是否在 save_steps 时保存 optimizer/scheduler/RNG/global step 等完整断点。
-resume_training_checkpoint=""  # 从完整训练断点恢复；可填 latest 或 step 目录。
+resume_training_checkpoint="outputs/WanWorldModel_film_no_language_abs_action_fix_resume1/training_checkpoints/step-10000"  # 从完整训练断点恢复；可填 latest 或 step 目录。
 training_checkpoint_dir=""  # 完整训练断点目录；留空默认 output_path/training_checkpoints。
 
 # =========================

@@ -169,6 +169,19 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
         return data
 
 
+class IndexedEvalDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        sample_id = self.indices[index]
+        return sample_id, self.dataset[sample_id]
+
+
 @contextmanager
 def main_process_output(is_main_process):
     if is_main_process:
@@ -413,12 +426,7 @@ class WanWorldModelEvalCallback:
         self.video_fps = int(video_fps)
         self.metric_batch_size = int(metric_batch_size)
         self.output_path = output_path
-        self.dataloader = torch.utils.data.DataLoader(
-            dataset,
-            shuffle=False,
-            collate_fn=lambda x: x[0],
-            num_workers=num_workers,
-        )
+        self.num_workers = int(num_workers)
         self.lpips_metric = None
         self.fid_metric = None
 
@@ -428,7 +436,17 @@ class WanWorldModelEvalCallback:
     def should_upload_videos(self, step):
         return self.upload_video_steps > 0 and step > 0 and step % self.upload_video_steps == 0
 
-    def _ensure_metrics(self, device):
+    def build_rank_dataloader(self, accelerator):
+        indices = range(accelerator.process_index, len(self.dataset), accelerator.num_processes)
+        dataset = IndexedEvalDataset(self.dataset, indices)
+        return torch.utils.data.DataLoader(
+            dataset,
+            shuffle=False,
+            collate_fn=lambda x: x[0],
+            num_workers=self.num_workers,
+        )
+
+    def _ensure_lpips_metric(self, device):
         if self.lpips_metric is None:
             from diffsynth.metrics import LPIPSMetric
             self.lpips_metric = LPIPSMetric.from_pretrained(
@@ -436,12 +454,18 @@ class WanWorldModelEvalCallback:
                 device=device,
                 batch_size=self.metric_batch_size,
             )
+
+    def _ensure_fid_metric(self, device):
         if self.fid_metric is None:
             from diffsynth.metrics import FIDMetric
             self.fid_metric = FIDMetric.from_pretrained(
                 device=device,
                 batch_size=self.metric_batch_size,
             )
+
+    def _ensure_metrics(self, device):
+        self._ensure_lpips_metric(device)
+        self._ensure_fid_metric(device)
 
     def _reconstruct_video(self, pipe, video):
         pipe.load_models_to_device(["vae"])
@@ -514,20 +538,126 @@ class WanWorldModelEvalCallback:
         gt_tensor = pil_video_to_tensor(gt_metrics)
         return pred_metrics, gt_metrics, pred_tensor, gt_tensor
 
-    def _compute_metrics(self, pred_frames, gt_frames, pred_tensors, gt_tensors, device):
-        self._ensure_metrics(device)
+    def _sum_across_processes(self, accelerator, values):
+        tensor = torch.tensor(values, dtype=torch.float64, device=accelerator.device)
+        if accelerator.num_processes == 1:
+            return tensor.detach().cpu()
+        gathered = accelerator.gather(tensor)
+        return gathered.view(accelerator.num_processes, tensor.numel()).sum(dim=0).detach().cpu()
+
+    def _gather_variable_length_tensor(self, accelerator, tensor):
+        if tensor.device != accelerator.device:
+            tensor = tensor.to(device=accelerator.device)
+        length = torch.tensor([tensor.shape[0]], dtype=torch.long, device=accelerator.device)
+        if accelerator.num_processes == 1:
+            return tensor.detach().cpu()
+
+        lengths = accelerator.gather(length).to(device=accelerator.device)
+        max_length = int(lengths.max().item())
+        feature_shape = tensor.shape[1:]
+        if tensor.shape[0] < max_length:
+            padding = tensor.new_zeros((max_length - tensor.shape[0], *feature_shape))
+            tensor = torch.cat([tensor, padding], dim=0)
+        if max_length == 0:
+            gathered = tensor.new_empty((accelerator.num_processes, 0, *feature_shape))
+        else:
+            gathered = accelerator.gather(tensor.contiguous())
+            gathered = gathered.view(accelerator.num_processes, max_length, *feature_shape)
+
+        if not accelerator.is_main_process:
+            return None
+        chunks = []
+        for rank, rank_length in enumerate(lengths.detach().cpu().tolist()):
+            if rank_length > 0:
+                chunks.append(gathered[rank, :rank_length].detach().cpu())
+        if len(chunks) == 0:
+            return tensor.new_empty((0, *feature_shape)).detach().cpu()
+        return torch.cat(chunks, dim=0)
+
+    def _gather_objects(self, accelerator, value):
+        if accelerator.num_processes == 1:
+            return [value]
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return [value]
+        gathered = [None for _ in range(accelerator.num_processes)]
+        torch.distributed.all_gather_object(gathered, value)
+        return gathered
+
+    def _compute_local_metric_sums(self, pred_frames, gt_frames, pred_tensors, gt_tensors, device):
+        if len(pred_tensors) == 0:
+            return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
         pred = torch.cat(pred_tensors, dim=0).to(device=device)
         gt = torch.cat(gt_tensors, dim=0).to(device=device)
+        frame_count = pred.shape[0]
 
-        mse = F.mse_loss(pred, gt).item()
-        psnr = 10.0 * math.log10(1.0 / max(mse, 1e-12))
-        ssim = float(ssim_torch(pred, gt).detach().cpu().item())
+        squared_error_sum = F.mse_loss(pred, gt, reduction="sum").detach().cpu().item()
+        numel = float(pred.numel())
+        ssim_sum = float(ssim_torch(pred, gt).detach().cpu().item()) * frame_count
 
-        lpips_scores = []
+        self._ensure_lpips_metric(device)
+        lpips_sum = 0.0
         for pred_frame, gt_frame in zip(pred_frames, gt_frames):
-            lpips_scores.append(self.lpips_metric.compute(pred_frame, gt_frame))
-        lpips = float(sum(lpips_scores) / max(len(lpips_scores), 1))
-        fid = self.fid_metric.compute(gt_frames, pred_frames, batch_size=self.metric_batch_size)
+            lpips_sum += float(self.lpips_metric.compute(pred_frame, gt_frame))
+
+        return [
+            squared_error_sum,
+            numel,
+            ssim_sum,
+            float(frame_count),
+            lpips_sum,
+            float(len(pred_frames)),
+        ]
+
+    def _compute_local_fid_activations(self, gt_frames, pred_frames, device):
+        feature_dim = 2048
+        if len(pred_frames) == 0:
+            empty = torch.empty((0, feature_dim), dtype=torch.float64, device=device)
+            return empty, empty
+        self._ensure_fid_metric(device)
+        gt_activations = self.fid_metric.model.get_activations(
+            gt_frames,
+            batch_size=self.metric_batch_size,
+        ).to(device=device)
+        pred_activations = self.fid_metric.model.get_activations(
+            pred_frames,
+            batch_size=self.metric_batch_size,
+        ).to(device=device)
+        return gt_activations, pred_activations
+
+    def _compute_distributed_metrics(self, accelerator, pred_frames, gt_frames, pred_tensors, gt_tensors, device):
+        local_sums = self._compute_local_metric_sums(
+            pred_frames,
+            gt_frames,
+            pred_tensors,
+            gt_tensors,
+            device=device,
+        )
+        global_sums = self._sum_across_processes(accelerator, local_sums)
+
+        gt_activations, pred_activations = self._compute_local_fid_activations(gt_frames, pred_frames, device)
+        gt_activations = self._gather_variable_length_tensor(accelerator, gt_activations)
+        pred_activations = self._gather_variable_length_tensor(accelerator, pred_activations)
+
+        if not accelerator.is_main_process:
+            return None
+
+        squared_error_sum, numel, ssim_sum, ssim_count, lpips_sum, lpips_count = global_sums.tolist()
+        mse = float(squared_error_sum / max(numel, 1.0))
+        psnr = 10.0 * math.log10(1.0 / max(mse, 1e-12))
+        ssim = float(ssim_sum / max(ssim_count, 1.0))
+        lpips = float(lpips_sum / max(lpips_count, 1.0))
+
+        self._ensure_fid_metric(device)
+        gt_mean, gt_covariance = self.fid_metric.model.activation_statistics(gt_activations)
+        pred_mean, pred_covariance = self.fid_metric.model.activation_statistics(pred_activations)
+        fid = self.fid_metric.model.frechet_distance(
+            gt_mean,
+            gt_covariance,
+            pred_mean,
+            pred_covariance,
+        )
+        fid = fid.detach().cpu().item() if torch.is_tensor(fid) else float(fid)
 
         return {
             "val/mse": mse,
@@ -555,7 +685,7 @@ class WanWorldModelEvalCallback:
             pipe.units = getattr(training_module, "inference_units", pipe.units)
             training_module.eval()
             with torch.no_grad():
-                for sample_id, data in enumerate(self.dataloader):
+                for sample_id, data in self.build_rank_dataloader(accelerator):
                     pred_metric_frames, gt_metric_frames, pred_tensor, gt_tensor = self._evaluate_sample(
                         pipe,
                         data,
@@ -569,17 +699,24 @@ class WanWorldModelEvalCallback:
                     pred_tensors.append(pred_tensor)
                     gt_tensors.append(gt_tensor)
 
-                metrics = self._compute_metrics(
+                metrics = self._compute_distributed_metrics(
+                    accelerator,
                     pred_frames,
                     gt_frames,
                     pred_tensors,
                     gt_tensors,
                     device=pipe.device,
                 )
-                print(f"[Eval step {step}] " + ", ".join(f"{key}={value:.6f}" for key, value in metrics.items()))
-                model_logger.log_metrics(metrics, step=step)
-                if video_paths:
-                    model_logger.log_videos(video_paths, step=step, fps=self.video_fps)
+                gathered_video_paths = self._gather_objects(accelerator, video_paths)
+                if accelerator.is_main_process:
+                    merged_video_paths = {}
+                    for rank_video_paths in gathered_video_paths:
+                        if rank_video_paths:
+                            merged_video_paths.update(rank_video_paths)
+                    print(f"[Eval step {step}] " + ", ".join(f"{key}={value:.6f}" for key, value in metrics.items()))
+                    model_logger.log_metrics(metrics, step=step)
+                    if merged_video_paths:
+                        model_logger.log_videos(merged_video_paths, step=step, fps=self.video_fps)
         finally:
             pipe.units = training_units
             for module, training in module_modes:
@@ -634,12 +771,15 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
                     trainable_model_names.append("action_embedder")
                     trainable_models = ",".join(trainable_model_names)
 
+        model_load_device = device
+        if not use_text_condition and not fp8_models and not offload_models:
+            model_load_device = "cpu"
         model_configs = self.parse_model_configs(
             model_paths,
             model_id_with_origin_paths,
             fp8_models=fp8_models,
             offload_models=offload_models,
-            device=device,
+            device=model_load_device,
         )
         if len(model_configs) == 0:
             model_configs = None
@@ -650,7 +790,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         )
         self.pipe = WanWorldModelPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
-            device=device,
+            device=model_load_device,
             model_configs=model_configs,
             tokenizer_config=tokenizer_config,
             action_dim=action_dim,
@@ -662,7 +802,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             action_normalization_mode=action_normalization_mode,
             use_text_condition=use_text_condition,
             text_context_length=text_context_length,
-            redirect_common_files=False,
+            redirect_common_files=True,
         )
         self.inference_units = list(self.pipe.units)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)
@@ -695,11 +835,33 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
 
+    @staticmethod
+    def _is_language_condition_state_key(name):
+        return (
+            ".text_embedding." in name
+            or ".cross_attn." in name
+            or ".norm3." in name
+        )
+
+    def _language_condition_modules_removed(self):
+        dit = getattr(self.pipe, "dit", None)
+        return dit is not None and getattr(dit, "text_embedding", None) is None
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if self._language_condition_modules_removed():
+            state_dict = {
+                name: value
+                for name, value in state_dict.items()
+                if not self._is_language_condition_state_key(name)
+            }
+            strict = False
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def freeze_language_condition_modules(self):
         dit = self.pipe.dit
         if dit is None:
             return
-        if hasattr(dit, "text_embedding"):
+        if getattr(dit, "text_embedding", None) is not None:
             dit.text_embedding.eval()
             dit.text_embedding.requires_grad_(False)
         for block in getattr(dit, "blocks", []):

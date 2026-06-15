@@ -194,6 +194,18 @@ class WanWorldModelPipeline(BasePipeline):
         text_encoder_markers = ("umt5", "models_t5", "text_encoder")
         return any(any(marker in str(value).lower() for marker in text_encoder_markers) for value in values)
 
+    @staticmethod
+    def remove_dit_language_condition_modules(dit: WanModel = None):
+        if dit is None:
+            return
+        if hasattr(dit, "text_embedding"):
+            dit.text_embedding = None
+        for block in getattr(dit, "blocks", []):
+            if hasattr(block, "cross_attn"):
+                block.cross_attn = None
+            if hasattr(block, "norm3"):
+                block.norm3 = None
+
     @classmethod
     def from_pretrained(
         cls,
@@ -254,6 +266,8 @@ class WanWorldModelPipeline(BasePipeline):
         pipe.text_encoder = model_pool.fetch_model("wan_video_text_encoder") if use_text_condition else None
         pipe.dit = model_pool.fetch_model("wan_video_dit")
         pipe.vae = model_pool.fetch_model("wan_video_vae")
+        if not use_text_condition:
+            pipe.remove_dit_language_condition_modules(pipe.dit)
         pipe.build_action_embedder(
             action_dim=action_dim,
             hidden_dim=action_embedder_hidden_dim,

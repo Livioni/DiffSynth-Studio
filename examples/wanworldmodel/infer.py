@@ -346,20 +346,24 @@ def run(args):
             output_type="quantized",
         )
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    task_name = sanitize_name(data["task"])
+    episode_name = sanitize_name(data["episode"])
+    sample_output_dir = os.path.join(args.output_dir, f"{task_name}_{episode_name}")
+    os.makedirs(sample_output_dir, exist_ok=True)
     stem = "_".join(
         [
-            sanitize_name(data["task"]),
-            sanitize_name(data["episode"]),
+            task_name,
+            episode_name,
             f"start{int(args.start_frame)}",
+            f"step_{int(args.num_inference_steps):04d}",
             f"seed{int(args.seed) if args.seed is not None else 'none'}",
         ]
     )
-    pred_path = os.path.join(args.output_dir, f"{stem}_pred.mp4")
-    gt_path = os.path.join(args.output_dir, f"{stem}_gt.mp4")
-    input_path = os.path.join(args.output_dir, f"{stem}_input.png")
-    action_path = os.path.join(args.output_dir, f"{stem}_action.npy")
-    metadata_path = os.path.join(args.output_dir, f"{stem}.json")
+    pred_path = os.path.join(sample_output_dir, f"{stem}_pred.mp4")
+    gt_path = os.path.join(sample_output_dir, f"{stem}_gt.mp4")
+    input_path = os.path.join(sample_output_dir, f"{stem}_input.png")
+    action_path = os.path.join(sample_output_dir, f"{stem}_action.npy")
+    metadata_path = os.path.join(sample_output_dir, f"{stem}.json")
 
     save_pil_video(pred_video, pred_path, fps=args.fps)
     if args.save_gt:
@@ -387,6 +391,7 @@ def run(args):
         "num_inference_steps": args.num_inference_steps,
         "action_shape": [int(item) for item in action.shape],
         "checkpoint_path": args.checkpoint_path,
+        "output_dir": sample_output_dir,
         "prediction_path": pred_path,
         "ground_truth_path": gt_path if args.save_gt else None,
         "input_image_path": input_path if args.save_input else None,
@@ -406,7 +411,7 @@ def build_parser():
 
     parser.add_argument("--eval_dataset_base_path", type=str, default="world_model_data/robotwin_aloha/val_set")
     parser.add_argument("--task", type=str, default="adjust_bottle", help="Eval task folder. Defaults to the first indexed task.")
-    parser.add_argument("--episode", type=str, default="episode0", help="Episode name, e.g. episode0. Defaults to the first episode for the task.")
+    parser.add_argument("--episode", type=str, default="episode57", help="Episode name, e.g. episode0. Defaults to the first episode for the task.")
     parser.add_argument("--start_frame", type=int, default=0, help="Start frame of the eval window.")
     parser.add_argument("--camera", type=str, default="head_camera")
     parser.add_argument("--include_failed", default=False, action="store_true")
@@ -416,9 +421,9 @@ def build_parser():
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--num_frames", type=int, default=25)
-    parser.add_argument("--fps", type=int, default=4)
+    parser.add_argument("--fps", type=int, default=25)
 
-    parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_film_no_language/step-20000.safetensors")
+    parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_film_no_language_abs_action_fix_resume2/step-100000.safetensors")
     parser.add_argument("--output_dir", type=str, default="outputs/inference")
     parser.add_argument("--dit_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors")
     parser.add_argument("--text_encoder_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/models_t5_umt5-xxl-enc-bf16.safetensors")

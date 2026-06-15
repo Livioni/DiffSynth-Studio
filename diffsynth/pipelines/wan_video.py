@@ -1455,6 +1455,8 @@ def model_fn_wan_video(
         raise ValueError("disable_context_attention is not supported with context-dependent VACE/VAP/WanToDance adapters.")
     context_batch_size = latents.shape[0] if context is None else context.shape[0]
     if not disable_context_attention:
+        if getattr(dit, "text_embedding", None) is None:
+            raise ValueError("Text embedding was removed; set disable_context_attention=True.")
         context = dit.text_embedding(context)
 
     x = latents

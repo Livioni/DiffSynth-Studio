@@ -496,8 +496,7 @@ def launch_training_task(
                     )
                 if eval_callback is not None and eval_callback.should_run(model_logger.num_steps):
                     accelerator.wait_for_everyone()
-                    if accelerator.is_main_process:
-                        eval_callback(accelerator, model, model_logger)
+                    eval_callback(accelerator, model, model_logger)
                     accelerator.wait_for_everyone()
         start_batch_in_epoch = 0
         if save_steps is None:

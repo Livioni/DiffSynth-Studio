@@ -344,6 +344,8 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
         if not disable_context_attention:
+            if self.cross_attn is None or self.norm3 is None:
+                raise ValueError("Context attention modules were removed; set disable_context_attention=True.")
             x = x + self.cross_attn(self.norm3(x), context)
         if action_emb is not None and method == "cross_attention":
             if action_emb.shape[-1] != self.dim:
@@ -663,6 +665,8 @@ class WanModel(torch.nn.Module):
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         if not disable_context_attention:
+            if self.text_embedding is None:
+                raise ValueError("Text embedding was removed; set disable_context_attention=True.")
             context = self.text_embedding(context)
         
         if self.has_image_input:
