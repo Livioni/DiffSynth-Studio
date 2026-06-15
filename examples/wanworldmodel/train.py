@@ -82,11 +82,40 @@ def validate_world_model_history_frames(history_frames):
     return history_frames
 
 
+def validate_world_model_history_stride(history_stride):
+    history_stride = int(history_stride or 4)
+    if history_stride < 4:
+        raise ValueError(
+            "--world_model_history_stride must be at least 4, "
+            f"got {history_stride}."
+        )
+    return history_stride
+
+
 def validate_probability(value, name):
     value = float(value or 0.0)
     if value < 0.0 or value > 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value}.")
     return value
+
+
+def build_history_frame_segments(history_end, history_latent_count, history_stride):
+    history_end = int(history_end)
+    history_latent_count = int(history_latent_count)
+    history_stride = validate_world_model_history_stride(history_stride)
+    segments = []
+    for offset in reversed(range(history_latent_count)):
+        segment_start = history_end - 4 - offset * history_stride
+        if segment_start < 0:
+            continue
+        segments.append(torch.arange(segment_start, segment_start + 4, dtype=torch.long))
+    return segments
+
+
+def flatten_history_frame_segments(segments):
+    if len(segments) == 0:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(segments, dim=0)
 
 
 class WorldModelTrainingDataset(torch.utils.data.Dataset):
@@ -96,12 +125,14 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
         video_camera="head_camera",
         frame_processor=None,
         history_frames=0,
+        history_stride=4,
         history_dropout_prob=0.0,
     ):
         self.dataset = dataset
         self.video_camera = video_camera
         self.frame_processor = frame_processor
         self.history_frames = validate_world_model_history_frames(history_frames)
+        self.history_stride = validate_world_model_history_stride(history_stride)
         self.history_dropout_prob = validate_probability(history_dropout_prob, "history_dropout_prob")
         self.load_from_cache = False
 
@@ -159,6 +190,7 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             "num_frames": getattr(self.dataset, "num_frames", None),
             "stride": getattr(self.dataset, "stride", None),
             "history_frames": self.history_frames,
+            "history_stride": self.history_stride,
             "history_dropout_prob": self.history_dropout_prob,
             "repeat": getattr(self.dataset, "repeat", None),
             "max_data_items": getattr(self.dataset, "max_data_items", None),
@@ -198,27 +230,55 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             data["action"] = action
         if self.history_frames > 0:
             history_end = int(data["frame_indices"][0])
-            history_start = max(0, history_end - self.history_frames)
-            history_indices = torch.arange(history_start, history_end, dtype=torch.long)
-            data["history_latent_count"] = self.history_frames // 4
+            history_latent_count = self.history_frames // 4
+            use_sparse_history = self.history_stride != 4
+            if use_sparse_history:
+                history_segments = build_history_frame_segments(history_end, history_latent_count, self.history_stride)
+                history_indices = flatten_history_frame_segments(history_segments)
+            else:
+                history_start = max(0, history_end - self.history_frames)
+                history_indices = torch.arange(history_start, history_end, dtype=torch.long)
+            data["history_latent_count"] = history_latent_count
             data["history_video"] = []
             drop_history = bool((torch.rand(()) < self.history_dropout_prob).item())
             data["history_dropped"] = drop_history
             data["history_frame_indices"] = torch.empty(0, dtype=torch.long) if drop_history else history_indices
             if len(history_indices) > 0 and not drop_history:
-                history_video = self.dataset._load_rgb_window(
-                    data["episode_path"],
-                    self.video_camera,
-                    history_indices,
-                )
-                if self.frame_processor is not None:
-                    history_video = [self.frame_processor(frame) for frame in history_video]
-                data["history_video"] = history_video
-                history_action = robot_action_to_tensor(
-                    self.dataset._load_robot_window(data["episode_path"], history_indices)
-                )
-                if history_action is not None:
-                    data["history_action"] = history_action
+                if use_sparse_history:
+                    history_video_segments = []
+                    history_action_segments = []
+                    for segment_indices in history_segments:
+                        history_video_segment = self.dataset._load_rgb_window(
+                            data["episode_path"],
+                            self.video_camera,
+                            segment_indices,
+                        )
+                        if self.frame_processor is not None:
+                            history_video_segment = [self.frame_processor(frame) for frame in history_video_segment]
+                        history_video_segments.append(history_video_segment)
+                        history_action = robot_action_to_tensor(
+                            self.dataset._load_robot_window(data["episode_path"], segment_indices)
+                        )
+                        if history_action is not None:
+                            history_action_segments.append(history_action)
+                    data["history_video_segments"] = history_video_segments
+                    data["history_video"] = [frame for segment in history_video_segments for frame in segment]
+                    if len(history_action_segments) == len(history_video_segments):
+                        data["history_action"] = torch.cat(history_action_segments, dim=0)
+                else:
+                    history_video = self.dataset._load_rgb_window(
+                        data["episode_path"],
+                        self.video_camera,
+                        history_indices,
+                    )
+                    if self.frame_processor is not None:
+                        history_video = [self.frame_processor(frame) for frame in history_video]
+                    data["history_video"] = history_video
+                    history_action = robot_action_to_tensor(
+                        self.dataset._load_robot_window(data["episode_path"], history_indices)
+                    )
+                    if history_action is not None:
+                        data["history_action"] = history_action
         return data
 
 
@@ -261,6 +321,7 @@ def print_world_model_training_dataset_summary(dataset, accelerator, label):
         f"[WorldModelTrainingDataset:{label}] roots={roots}; cameras={cameras}; "
         f"video_camera={stats['video_camera']}; num_frames={stats['num_frames']}; "
         f"stride={stats['stride']}; history_frames={stats['history_frames']}; "
+        f"history_stride={stats['history_stride']}; "
         f"history_dropout_prob={stats['history_dropout_prob']}; "
         f"repeat={stats['repeat']}; max_data_items={max_data_items}"
     )
@@ -319,6 +380,7 @@ def build_unified_dataset(args):
 
 def build_world_model_dataset(args):
     history_frames = validate_world_model_history_frames(args.world_model_history_frames)
+    history_stride = validate_world_model_history_stride(args.world_model_history_stride)
     history_dropout_prob = validate_probability(args.world_model_history_dropout_prob, "--world_model_history_dropout_prob")
     if history_dropout_prob > 0.0 and history_frames == 0:
         raise ValueError("--world_model_history_dropout_prob requires --world_model_history_frames > 0.")
@@ -360,6 +422,7 @@ def build_world_model_dataset(args):
         video_camera=args.world_model_video_camera,
         frame_processor=frame_processor,
         history_frames=history_frames,
+        history_stride=history_stride,
         history_dropout_prob=history_dropout_prob,
     )
 
@@ -372,6 +435,7 @@ def build_eval_dataset(args):
         return None
 
     history_frames = validate_world_model_history_frames(args.world_model_history_frames)
+    history_stride = validate_world_model_history_stride(args.world_model_history_stride)
     cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
     if args.world_model_video_camera not in cameras:
         cameras = (args.world_model_video_camera,) + cameras
@@ -399,6 +463,7 @@ def build_eval_dataset(args):
         video_camera=args.world_model_video_camera,
         frame_processor=frame_processor,
         history_frames=history_frames,
+        history_stride=history_stride,
         history_dropout_prob=0.0,
     )
 
@@ -409,6 +474,7 @@ def build_dataset(args):
         has_unified_data = args.dataset_metadata_path is not None or contains_cached_data_files(args.dataset_base_path)
         dataset_type = "unified" if has_unified_data else "world_model"
     history_frames = validate_world_model_history_frames(getattr(args, "world_model_history_frames", 0))
+    history_stride = validate_world_model_history_stride(getattr(args, "world_model_history_stride", 4))
     history_dropout_prob = validate_probability(getattr(args, "world_model_history_dropout_prob", 0.0), "--world_model_history_dropout_prob")
     if (history_frames > 0 or history_dropout_prob > 0.0) and dataset_type != "world_model":
         raise ValueError("--world_model_history_frames is only supported with --dataset_type=world_model.")
@@ -1023,6 +1089,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         if self.world_model_history_latent_count > 0:
             inputs_shared["history_video"] = data.get("history_video", [])
+            inputs_shared["history_video_segments"] = data.get("history_video_segments")
             inputs_shared["history_latent_count"] = data.get("history_latent_count", self.world_model_history_latent_count)
             if "history_action" in data:
                 inputs_shared["history_action"] = data["history_action"]
@@ -1078,6 +1145,12 @@ def wan_world_model_parser():
         type=int,
         default=0,
         help="Number of RGB frames before each window used as causal VAE history. Must be divisible by 4; 16 gives 4 history latents. Missing prefix history is zero-padded in latent space.",
+    )
+    parser.add_argument(
+        "--world_model_history_stride",
+        type=int,
+        default=4,
+        help="Distance in raw frames between consecutive 4-frame history blocks. The default 4 keeps contiguous history; values >4 sparsify history while each VAE history latent still sees 4 continuous frames.",
     )
     parser.add_argument(
         "--world_model_history_dropout_prob",

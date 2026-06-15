@@ -48,6 +48,7 @@ world_model_static_action_eps=1e-8  # 判定 action 完全不变的 normalized d
 world_model_action_delta_low_threshold=0.02  # 低 action 变化 window 的 normalized delta mean 阈值。
 world_model_action_delta_low_weight=0.2  # 低 action 变化 window 的采样权重。
 world_model_history_frames=16
+world_model_history_stride=8  # 每隔 n 帧取一段连续 4 帧 history；4 表示原来的连续 16 帧。
 world_model_history_dropout_prob=0.3
 
 # =========================
@@ -212,6 +213,9 @@ add_flag --world_model_filter_static_action_windows "${world_model_filter_static
 add_arg --world_model_static_action_eps "${world_model_static_action_eps}"
 add_optional_arg --world_model_action_delta_low_threshold "${world_model_action_delta_low_threshold}"
 add_arg --world_model_action_delta_low_weight "${world_model_action_delta_low_weight}"
+add_arg --world_model_history_frames "${world_model_history_frames}"
+add_arg --world_model_history_stride "${world_model_history_stride}"
+add_arg --world_model_history_dropout_prob "${world_model_history_dropout_prob}"
 
 # Video Size / Sampling
 add_optional_arg --height "${height}"

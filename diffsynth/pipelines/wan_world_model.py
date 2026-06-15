@@ -306,6 +306,7 @@ class WanWorldModelPipeline(BasePipeline):
         tile_stride: tuple[int, int] = (15, 26),
         action: Union[torch.Tensor, list, tuple, dict] = None,
         history_video: list[Image.Image] = None,
+        history_video_segments: list[list[Image.Image]] = None,
         history_latents: torch.Tensor = None,
         history_action: Union[torch.Tensor, list, tuple, dict] = None,
         history_latent_count: int = 0,
@@ -329,6 +330,7 @@ class WanWorldModelPipeline(BasePipeline):
             "tile_stride": tile_stride,
             "action": action,
             "history_video": history_video,
+            "history_video_segments": history_video_segments,
             "history_latents": history_latents,
             "history_action": history_action,
             "history_latent_count": history_latent_count,
@@ -438,6 +440,7 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
         super().__init__(
             input_params=(
                 "history_video",
+                "history_video_segments",
                 "history_latents",
                 "history_latent_count",
                 "height",
@@ -497,10 +500,25 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
             device=pipe.device,
         )
 
+    @staticmethod
+    def _encode_history_video(pipe, history_video, height, width, tiled, tile_size, tile_stride):
+        history_video = [image.resize((width, height)) for image in history_video]
+        dummy_frame = Image.new("RGB", (width, height), (0, 0, 0))
+        history_video = pipe.preprocess_video([dummy_frame] + history_video)
+        history_latents = pipe.vae.encode(
+            history_video,
+            device=pipe.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        ).to(dtype=pipe.torch_dtype, device=pipe.device)
+        return history_latents[:, :, 1:]
+
     def process(
         self,
         pipe: WanWorldModelPipeline,
         history_video,
+        history_video_segments,
         history_latents,
         history_latent_count,
         height,
@@ -533,6 +551,56 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
                 "history_frame_count_used": available_count * 4,
             }
 
+        if history_video_segments is not None:
+            history_video_segments = [list(segment) for segment in history_video_segments if len(segment) >= 4]
+            if target_count == 0:
+                target_count = sum(len(segment) // 4 for segment in history_video_segments)
+
+            if target_count == 0:
+                return {
+                    "history_latent_count": 0,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+
+            pipe.load_models_to_device(self.onload_model_names)
+            encoded_segments = []
+            used_frame_count = 0
+            for segment in history_video_segments[-target_count:]:
+                segment_frame_count = (len(segment) // 4) * 4
+                if segment_frame_count == 0:
+                    continue
+                segment_latents = self._encode_history_video(
+                    pipe,
+                    segment[-segment_frame_count:],
+                    height,
+                    width,
+                    tiled,
+                    tile_size,
+                    tile_stride,
+                )
+                encoded_segments.append(segment_latents)
+                used_frame_count += int(segment_latents.shape[2]) * 4
+
+            if len(encoded_segments) == 0:
+                history_latents = self._zero_history_latents(pipe, target_count, height, width)
+                return {
+                    "history_latents": history_latents,
+                    "history_latent_count": target_count,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+
+            history_latents = torch.cat(encoded_segments, dim=2)
+            available_count = int(history_latents.shape[2])
+            history_latents = self._pad_or_crop_latents(history_latents, target_count)
+            return {
+                "history_latents": history_latents,
+                "history_latent_count": target_count,
+                "available_history_latent_count": available_count,
+                "history_frame_count_used": used_frame_count,
+            }
+
         history_video = [] if history_video is None else list(history_video)
         if target_count == 0:
             if len(history_video) == 0:
@@ -562,17 +630,15 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
             }
 
         pipe.load_models_to_device(self.onload_model_names)
-        history_video = [image.resize((width, height)) for image in history_video[-used_frame_count:]]
-        dummy_frame = Image.new("RGB", (width, height), (0, 0, 0))
-        history_video = pipe.preprocess_video([dummy_frame] + history_video)
-        history_latents = pipe.vae.encode(
-            history_video,
-            device=pipe.device,
-            tiled=tiled,
-            tile_size=tile_size,
-            tile_stride=tile_stride,
-        ).to(dtype=pipe.torch_dtype, device=pipe.device)
-        history_latents = history_latents[:, :, 1:]
+        history_latents = self._encode_history_video(
+            pipe,
+            history_video[-used_frame_count:],
+            height,
+            width,
+            tiled,
+            tile_size,
+            tile_stride,
+        )
         available_count = int(history_latents.shape[2])
         history_latents = self._pad_or_crop_latents(history_latents, target_count)
         return {

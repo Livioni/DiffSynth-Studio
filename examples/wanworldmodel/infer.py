@@ -119,23 +119,76 @@ def validate_world_model_history_frames(history_frames):
     return history_frames
 
 
-def load_history_inputs(dataset, frame_processor, data, camera, history_frames):
+def validate_world_model_history_stride(history_stride):
+    history_stride = int(history_stride or 4)
+    if history_stride < 4:
+        raise ValueError(
+            "--world_model_history_stride must be at least 4, "
+            f"got {history_stride}."
+        )
+    return history_stride
+
+
+def build_history_frame_segments(history_end, history_latent_count, history_stride):
+    import torch
+
+    history_end = int(history_end)
+    history_latent_count = int(history_latent_count)
+    history_stride = validate_world_model_history_stride(history_stride)
+    segments = []
+    for offset in reversed(range(history_latent_count)):
+        segment_start = history_end - 4 - offset * history_stride
+        if segment_start < 0:
+            continue
+        segments.append(torch.arange(segment_start, segment_start + 4, dtype=torch.long))
+    return segments
+
+
+def flatten_history_frame_segments(segments):
+    import torch
+
+    if len(segments) == 0:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(segments, dim=0)
+
+
+def load_history_inputs(dataset, frame_processor, data, camera, history_frames, history_stride=4):
     history_frames = validate_world_model_history_frames(history_frames)
+    history_stride = validate_world_model_history_stride(history_stride)
     if history_frames == 0:
-        return [], None, 0, []
+        return [], None, None, 0, []
 
     import torch
 
     history_end = int(data["frame_indices"][0])
-    history_start = max(0, history_end - history_frames)
-    history_indices = torch.arange(history_start, history_end, dtype=torch.long)
+    history_latent_count = history_frames // 4
+    if history_stride == 4:
+        history_start = max(0, history_end - history_frames)
+        history_indices = torch.arange(history_start, history_end, dtype=torch.long)
+    else:
+        history_segments = build_history_frame_segments(history_end, history_latent_count, history_stride)
+        history_indices = flatten_history_frame_segments(history_segments)
     if len(history_indices) == 0:
-        return [], None, history_frames // 4, []
+        return [], None, None, history_latent_count, []
 
-    history_video = dataset._load_rgb_window(data["episode_path"], camera, history_indices)
-    history_video = [frame_processor(frame) for frame in history_video]
-    history_action = robot_action_to_tensor(dataset._load_robot_window(data["episode_path"], history_indices))
-    return history_video, history_action, history_frames // 4, [int(item) for item in history_indices.tolist()]
+    if history_stride == 4:
+        history_video = dataset._load_rgb_window(data["episode_path"], camera, history_indices)
+        history_video = [frame_processor(frame) for frame in history_video]
+        history_action = robot_action_to_tensor(dataset._load_robot_window(data["episode_path"], history_indices))
+        history_video_segments = None
+    else:
+        history_video_segments = []
+        history_action_segments = []
+        for segment_indices in history_segments:
+            history_video_segment = dataset._load_rgb_window(data["episode_path"], camera, segment_indices)
+            history_video_segment = [frame_processor(frame) for frame in history_video_segment]
+            history_video_segments.append(history_video_segment)
+            history_action = robot_action_to_tensor(dataset._load_robot_window(data["episode_path"], segment_indices))
+            if history_action is not None:
+                history_action_segments.append(history_action)
+        history_video = [frame for segment in history_video_segments for frame in segment]
+        history_action = torch.cat(history_action_segments, dim=0) if len(history_action_segments) == len(history_video_segments) else None
+    return history_video, history_video_segments, history_action, history_latent_count, [int(item) for item in history_indices.tolist()]
 
 
 def build_dataset(args):
@@ -344,12 +397,13 @@ def run(args):
     action = robot_action_to_tensor(data["robot"])
     if action is None:
         raise ValueError(f"No robot action found in sample {data['task']}/{data['episode']}.")
-    history_video, history_action, history_latent_count, history_frame_indices = load_history_inputs(
+    history_video, history_video_segments, history_action, history_latent_count, history_frame_indices = load_history_inputs(
         dataset,
         frame_processor,
         data,
         args.camera,
         args.world_model_history_frames,
+        args.world_model_history_stride,
     )
 
     prompt = args.prompt if args.prompt is not None else selected_episode.text_conditions[0]
@@ -382,6 +436,7 @@ def run(args):
             tile_stride=tuple(args.tile_stride),
             action=action,
             history_video=history_video,
+            history_video_segments=history_video_segments,
             history_action=history_action,
             history_latent_count=history_latent_count,
             output_type="quantized",
@@ -425,6 +480,7 @@ def run(args):
         "frame_indices": [int(item) for item in data["frame_indices"].tolist()],
         "history_frame_indices": history_frame_indices,
         "history_latent_count": int(history_latent_count),
+        "history_stride": int(args.world_model_history_stride),
         "num_frames_requested": int(args.num_frames),
         "num_frames_generated": int(len(pred_video)),
         "height": int(target_height),
@@ -469,6 +525,12 @@ def build_parser():
         type=int,
         default=0,
         help="Number of RGB frames before the selected window used as causal VAE history. Must be divisible by 4; 16 gives 4 history latents.",
+    )
+    parser.add_argument(
+        "--world_model_history_stride",
+        type=int,
+        default=4,
+        help="Distance in raw frames between consecutive 4-frame history blocks. The default 4 keeps contiguous history; values >4 sparsify history.",
     )
     parser.add_argument("--fps", type=int, default=25)
 
