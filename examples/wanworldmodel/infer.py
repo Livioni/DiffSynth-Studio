@@ -107,6 +107,37 @@ def resize_pil_video(video, width, height):
     return [frame.resize(target_size, resample=resample) for frame in video]
 
 
+def validate_world_model_history_frames(history_frames):
+    history_frames = int(history_frames or 0)
+    if history_frames < 0:
+        raise ValueError(f"--world_model_history_frames must be non-negative, got {history_frames}.")
+    if history_frames % 4 != 0:
+        raise ValueError(
+            "--world_model_history_frames must be divisible by 4 for Wan causal VAE history encoding, "
+            f"got {history_frames}."
+        )
+    return history_frames
+
+
+def load_history_inputs(dataset, frame_processor, data, camera, history_frames):
+    history_frames = validate_world_model_history_frames(history_frames)
+    if history_frames == 0:
+        return [], None, 0, []
+
+    import torch
+
+    history_end = int(data["frame_indices"][0])
+    history_start = max(0, history_end - history_frames)
+    history_indices = torch.arange(history_start, history_end, dtype=torch.long)
+    if len(history_indices) == 0:
+        return [], None, history_frames // 4, []
+
+    history_video = dataset._load_rgb_window(data["episode_path"], camera, history_indices)
+    history_video = [frame_processor(frame) for frame in history_video]
+    history_action = robot_action_to_tensor(dataset._load_robot_window(data["episode_path"], history_indices))
+    return history_video, history_action, history_frames // 4, [int(item) for item in history_indices.tolist()]
+
+
 def build_dataset(args):
     from diffsynth.core import WorldModelDataset
     from diffsynth.core.data.operators import ImageCropAndResize
@@ -313,6 +344,13 @@ def run(args):
     action = robot_action_to_tensor(data["robot"])
     if action is None:
         raise ValueError(f"No robot action found in sample {data['task']}/{data['episode']}.")
+    history_video, history_action, history_latent_count, history_frame_indices = load_history_inputs(
+        dataset,
+        frame_processor,
+        data,
+        args.camera,
+        args.world_model_history_frames,
+    )
 
     prompt = args.prompt if args.prompt is not None else selected_episode.text_conditions[0]
     pipe, device = build_pipeline(args)
@@ -343,6 +381,9 @@ def run(args):
             tile_size=tuple(args.tile_size),
             tile_stride=tuple(args.tile_stride),
             action=action,
+            history_video=history_video,
+            history_action=history_action,
+            history_latent_count=history_latent_count,
             output_type="quantized",
         )
 
@@ -382,6 +423,8 @@ def run(args):
         "use_text_condition": bool(args.use_text_condition),
         "start_frame": int(args.start_frame),
         "frame_indices": [int(item) for item in data["frame_indices"].tolist()],
+        "history_frame_indices": history_frame_indices,
+        "history_latent_count": int(history_latent_count),
         "num_frames_requested": int(args.num_frames),
         "num_frames_generated": int(len(pred_video)),
         "height": int(target_height),
@@ -421,6 +464,12 @@ def build_parser():
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--num_frames", type=int, default=25)
+    parser.add_argument(
+        "--world_model_history_frames",
+        type=int,
+        default=0,
+        help="Number of RGB frames before the selected window used as causal VAE history. Must be divisible by 4; 16 gives 4 history latents.",
+    )
     parser.add_argument("--fps", type=int, default=25)
 
     parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_film_no_language_abs_action_fix_resume2/step-100000.safetensors")

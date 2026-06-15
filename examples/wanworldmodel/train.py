@@ -70,11 +70,39 @@ def default_action_metadata_path(dataset_base_path, metadata_key="robot_statisti
     return None
 
 
+def validate_world_model_history_frames(history_frames):
+    history_frames = int(history_frames or 0)
+    if history_frames < 0:
+        raise ValueError(f"--world_model_history_frames must be non-negative, got {history_frames}.")
+    if history_frames % 4 != 0:
+        raise ValueError(
+            "--world_model_history_frames must be divisible by 4 for Wan causal VAE history encoding, "
+            f"got {history_frames}."
+        )
+    return history_frames
+
+
+def validate_probability(value, name):
+    value = float(value or 0.0)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value}.")
+    return value
+
+
 class WorldModelTrainingDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, video_camera="head_camera", frame_processor=None):
+    def __init__(
+        self,
+        dataset,
+        video_camera="head_camera",
+        frame_processor=None,
+        history_frames=0,
+        history_dropout_prob=0.0,
+    ):
         self.dataset = dataset
         self.video_camera = video_camera
         self.frame_processor = frame_processor
+        self.history_frames = validate_world_model_history_frames(history_frames)
+        self.history_dropout_prob = validate_probability(history_dropout_prob, "history_dropout_prob")
         self.load_from_cache = False
 
     def __len__(self):
@@ -130,6 +158,8 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             "video_camera": self.video_camera,
             "num_frames": getattr(self.dataset, "num_frames", None),
             "stride": getattr(self.dataset, "stride", None),
+            "history_frames": self.history_frames,
+            "history_dropout_prob": self.history_dropout_prob,
             "repeat": getattr(self.dataset, "repeat", None),
             "max_data_items": getattr(self.dataset, "max_data_items", None),
             "episode_count": len(episodes),
@@ -166,6 +196,29 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
         action = robot_action_to_tensor(data["robot"])
         if action is not None:
             data["action"] = action
+        if self.history_frames > 0:
+            history_end = int(data["frame_indices"][0])
+            history_start = max(0, history_end - self.history_frames)
+            history_indices = torch.arange(history_start, history_end, dtype=torch.long)
+            data["history_latent_count"] = self.history_frames // 4
+            data["history_video"] = []
+            drop_history = bool((torch.rand(()) < self.history_dropout_prob).item())
+            data["history_dropped"] = drop_history
+            data["history_frame_indices"] = torch.empty(0, dtype=torch.long) if drop_history else history_indices
+            if len(history_indices) > 0 and not drop_history:
+                history_video = self.dataset._load_rgb_window(
+                    data["episode_path"],
+                    self.video_camera,
+                    history_indices,
+                )
+                if self.frame_processor is not None:
+                    history_video = [self.frame_processor(frame) for frame in history_video]
+                data["history_video"] = history_video
+                history_action = robot_action_to_tensor(
+                    self.dataset._load_robot_window(data["episode_path"], history_indices)
+                )
+                if history_action is not None:
+                    data["history_action"] = history_action
         return data
 
 
@@ -207,7 +260,9 @@ def print_world_model_training_dataset_summary(dataset, accelerator, label):
     print(
         f"[WorldModelTrainingDataset:{label}] roots={roots}; cameras={cameras}; "
         f"video_camera={stats['video_camera']}; num_frames={stats['num_frames']}; "
-        f"stride={stats['stride']}; repeat={stats['repeat']}; max_data_items={max_data_items}"
+        f"stride={stats['stride']}; history_frames={stats['history_frames']}; "
+        f"history_dropout_prob={stats['history_dropout_prob']}; "
+        f"repeat={stats['repeat']}; max_data_items={max_data_items}"
     )
     print(
         f"[WorldModelTrainingDataset:{label}] episodes={stats['episode_count']}; "
@@ -263,6 +318,10 @@ def build_unified_dataset(args):
 
 
 def build_world_model_dataset(args):
+    history_frames = validate_world_model_history_frames(args.world_model_history_frames)
+    history_dropout_prob = validate_probability(args.world_model_history_dropout_prob, "--world_model_history_dropout_prob")
+    if history_dropout_prob > 0.0 and history_frames == 0:
+        raise ValueError("--world_model_history_dropout_prob requires --world_model_history_frames > 0.")
     cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
     if args.world_model_video_camera not in cameras:
         cameras = (args.world_model_video_camera,) + cameras
@@ -300,6 +359,8 @@ def build_world_model_dataset(args):
         dataset,
         video_camera=args.world_model_video_camera,
         frame_processor=frame_processor,
+        history_frames=history_frames,
+        history_dropout_prob=history_dropout_prob,
     )
 
 
@@ -310,6 +371,7 @@ def build_eval_dataset(args):
         warnings.warn(f"Eval dataset root does not exist, skip periodic eval: {args.eval_dataset_base_path}")
         return None
 
+    history_frames = validate_world_model_history_frames(args.world_model_history_frames)
     cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
     if args.world_model_video_camera not in cameras:
         cameras = (args.world_model_video_camera,) + cameras
@@ -336,6 +398,8 @@ def build_eval_dataset(args):
         dataset,
         video_camera=args.world_model_video_camera,
         frame_processor=frame_processor,
+        history_frames=history_frames,
+        history_dropout_prob=0.0,
     )
 
 
@@ -344,6 +408,12 @@ def build_dataset(args):
     if dataset_type == "auto":
         has_unified_data = args.dataset_metadata_path is not None or contains_cached_data_files(args.dataset_base_path)
         dataset_type = "unified" if has_unified_data else "world_model"
+    history_frames = validate_world_model_history_frames(getattr(args, "world_model_history_frames", 0))
+    history_dropout_prob = validate_probability(getattr(args, "world_model_history_dropout_prob", 0.0), "--world_model_history_dropout_prob")
+    if (history_frames > 0 or history_dropout_prob > 0.0) and dataset_type != "world_model":
+        raise ValueError("--world_model_history_frames is only supported with --dataset_type=world_model.")
+    if history_dropout_prob > 0.0 and history_frames == 0:
+        raise ValueError("--world_model_history_dropout_prob requires --world_model_history_frames > 0.")
 
     if dataset_type == "world_model":
         return build_world_model_dataset(args)
@@ -374,6 +444,50 @@ def resize_pil_video(video, width, height):
         return video
     resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
     return [frame.resize(target_size, resample=resample) for frame in video]
+
+
+def FlowMatchWanWorldModelHistoryLoss(pipe, **inputs):
+    if "lora" in inputs:
+        pipe.clear_lora(verbose=0)
+        pipe.load_lora(pipe.dit, state_dict=inputs["lora"], hotload=True, verbose=0)
+
+    max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
+    min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
+
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+
+    noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
+    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
+    training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
+
+    if "first_frame_latents" in inputs:
+        inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
+
+    history_latent_count = int(inputs.get("history_latent_count") or 0)
+    model_inputs = inputs
+    if history_latent_count > 0:
+        history_latents = inputs.get("history_latents")
+        if history_latents is None:
+            raise ValueError("history_latents is required when history_latent_count > 0.")
+        model_inputs = dict(inputs)
+        model_inputs["latents"] = torch.cat([history_latents, inputs["latents"]], dim=2)
+        model_inputs["clean_prefix_latent_count"] = history_latent_count + (
+            1 if "first_frame_latents" in inputs else 0
+        )
+
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    noise_pred = pipe.model_fn(**models, **model_inputs, timestep=timestep)
+
+    if history_latent_count > 0:
+        noise_pred = noise_pred[:, :, history_latent_count:]
+    if "first_frame_latents" in inputs:
+        noise_pred = noise_pred[:, :, 1:]
+        training_target = training_target[:, :, 1:]
+
+    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+    loss = loss * pipe.scheduler.training_weight(timestep)
+    return loss
 
 
 def ssim_torch(x, y, window_size=11, sigma=1.5):
@@ -508,6 +622,9 @@ class WanWorldModelEvalCallback:
             num_inference_steps=self.num_inference_steps,
             tiled=False,
             action=data.get("action"),
+            history_video=data.get("history_video"),
+            history_action=data.get("history_action"),
+            history_latent_count=data.get("history_latent_count", 0),
             progress_bar_cmd=lambda x: x,
             output_type="quantized",
         )
@@ -754,8 +871,10 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         action_normalization_mode="standard",
         use_text_condition=True,
         text_context_length=512,
+        world_model_history_frames=0,
     ):
         super().__init__()
+        world_model_history_frames = validate_world_model_history_frames(world_model_history_frames)
         if not use_gradient_checkpointing:
             warnings.warn("Gradient checkpointing is disabled. The training framework will enable it to reduce OOM risk.")
             use_gradient_checkpointing = True
@@ -819,6 +938,8 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
+        self.world_model_history_frames = world_model_history_frames
+        self.world_model_history_latent_count = world_model_history_frames // 4
         self.extra_inputs = [item.strip() for item in extra_inputs.split(",") if item.strip()] if extra_inputs is not None else []
         if action_enabled and "action" not in self.extra_inputs:
             self.extra_inputs.append("action")
@@ -827,8 +948,8 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
-            "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
-            "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchWanWorldModelHistoryLoss(pipe, **inputs_shared, **inputs_posi),
+            "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchWanWorldModelHistoryLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
@@ -900,6 +1021,11 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             "disable_context_attention": not self.use_text_condition,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        if self.world_model_history_latent_count > 0:
+            inputs_shared["history_video"] = data.get("history_video", [])
+            inputs_shared["history_latent_count"] = data.get("history_latent_count", self.world_model_history_latent_count)
+            if "history_action" in data:
+                inputs_shared["history_action"] = data["history_action"]
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
@@ -947,6 +1073,18 @@ def wan_world_model_parser():
     parser.add_argument("--world_model_cameras", type=str, default=None, help="Comma-separated cameras to load. Defaults to --world_model_video_camera.")
     parser.add_argument("--world_model_video_camera", type=str, default="head_camera", help="Camera RGB stream used as training video.")
     parser.add_argument("--world_model_stride", type=int, default=None, help="Stride between fixed-length world-model windows. Defaults to num_frames.")
+    parser.add_argument(
+        "--world_model_history_frames",
+        type=int,
+        default=0,
+        help="Number of RGB frames before each window used as causal VAE history. Must be divisible by 4; 16 gives 4 history latents. Missing prefix history is zero-padded in latent space.",
+    )
+    parser.add_argument(
+        "--world_model_history_dropout_prob",
+        type=float,
+        default=0.0,
+        help="Training-only probability of dropping all history RGB/action for a sample while keeping zero-padded history latent slots.",
+    )
     parser.add_argument("--world_model_include_depth", default=False, action="store_true", help="Load depth arrays from WorldModelDataset.")
     parser.add_argument("--world_model_include_camera_params", default=False, action="store_true", help="Load camera intrinsics/extrinsics from WorldModelDataset.")
     parser.add_argument("--world_model_include_failed", default=False, action="store_true", help="Include failed episodes from WorldModelDataset.")
@@ -1141,6 +1279,7 @@ if __name__ == "__main__":
             action_normalization_mode=args.action_normalization_mode,
             use_text_condition=args.use_text_condition,
             text_context_length=args.text_context_length,
+            world_model_history_frames=args.world_model_history_frames,
         )
     accelerator.wait_for_everyone()
     model_logger = ModelLogger(

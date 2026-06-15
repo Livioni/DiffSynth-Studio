@@ -1357,6 +1357,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    clean_prefix_latent_count: Optional[int] = None,
     wantodance_refimage_feature = None,
     wantodance_fps: float = 30.0,
     music_feature = None,
@@ -1429,9 +1430,13 @@ def model_fn_wan_video(
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+        tokens_per_latent_frame = latents.shape[3] * latents.shape[4] // 4
+        if clean_prefix_latent_count is None:
+            clean_prefix_latent_count = 1
+        clean_prefix_latent_count = max(0, min(int(clean_prefix_latent_count), latents.shape[2]))
         timestep = torch.concat([
-            torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
-            torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
+            torch.zeros((clean_prefix_latent_count, tokens_per_latent_frame), dtype=latents.dtype, device=latents.device),
+            torch.ones((latents.shape[2] - clean_prefix_latent_count, tokens_per_latent_frame), dtype=latents.dtype, device=latents.device) * timestep
         ]).flatten()
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
         if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:

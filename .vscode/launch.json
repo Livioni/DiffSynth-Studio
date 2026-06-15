@@ -146,6 +146,10 @@
         "1e-4",
         "--world_model_stride",
         "6",
+        "--world_model_history_frames",
+        "16",
+        "--world_model_history_dropout_prob",
+        "0.3",
         "--no_language_condition"
       ]
     },

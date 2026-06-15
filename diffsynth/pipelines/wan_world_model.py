@@ -101,6 +101,7 @@ class WanWorldModelPipeline(BasePipeline):
             WanWorldModelUnit_ShapeChecker(),
             WanWorldModelUnit_NoiseInitializer(),
             WanWorldModelUnit_InputVideoEmbedder(),
+            WanWorldModelUnit_HistoryEmbedder(),
             WanWorldModelUnit_PromptEmbedder(),
             WanWorldModelUnit_ActionEmbedder(),
             WanWorldModelUnit_InputImageEmbedderFused(),
@@ -304,6 +305,10 @@ class WanWorldModelPipeline(BasePipeline):
         tile_size: tuple[int, int] = (30, 52),
         tile_stride: tuple[int, int] = (15, 26),
         action: Union[torch.Tensor, list, tuple, dict] = None,
+        history_video: list[Image.Image] = None,
+        history_latents: torch.Tensor = None,
+        history_action: Union[torch.Tensor, list, tuple, dict] = None,
+        history_latent_count: int = 0,
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
     ):
@@ -323,6 +328,10 @@ class WanWorldModelPipeline(BasePipeline):
             "tile_size": tile_size,
             "tile_stride": tile_stride,
             "action": action,
+            "history_video": history_video,
+            "history_latents": history_latents,
+            "history_action": history_action,
+            "history_latent_count": history_latent_count,
             "disable_context_attention": not self.use_text_condition,
         }
         for unit in self.units:
@@ -331,14 +340,28 @@ class WanWorldModelPipeline(BasePipeline):
         # 扩散迭代阶段只调用 DiT；负向提示词仅在 CFG 生效时计算。
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
+        history_latent_count = int(inputs_shared.get("history_latent_count") or 0)
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+            model_inputs_shared = inputs_shared
+            if history_latent_count > 0:
+                model_inputs_shared = dict(inputs_shared)
+                model_inputs_shared["latents"] = torch.cat(
+                    [inputs_shared["history_latents"], inputs_shared["latents"]],
+                    dim=2,
+                )
+                model_inputs_shared["clean_prefix_latent_count"] = history_latent_count + (
+                    1 if "first_frame_latents" in inputs_shared else 0
+                )
+
+            noise_pred_posi = self.model_fn(**models, **model_inputs_shared, **inputs_posi, timestep=timestep)
             if cfg_scale != 1.0:
-                noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                noise_pred_nega = self.model_fn(**models, **model_inputs_shared, **inputs_nega, timestep=timestep)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
+            if history_latent_count > 0:
+                noise_pred = noise_pred[:, :, history_latent_count:]
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
@@ -410,6 +433,156 @@ class WanWorldModelUnit_InputVideoEmbedder(PipelineUnit):
         return {"latents": latents}
 
 
+class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=(
+                "history_video",
+                "history_latents",
+                "history_latent_count",
+                "height",
+                "width",
+                "tiled",
+                "tile_size",
+                "tile_stride",
+            ),
+            output_params=(
+                "history_latents",
+                "history_latent_count",
+                "available_history_latent_count",
+                "history_frame_count_used",
+            ),
+            onload_model_names=("vae",),
+        )
+
+    @staticmethod
+    def _as_int(value, default=0):
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            return int(value.detach().flatten()[0].item())
+        return int(value)
+
+    @staticmethod
+    def _pad_or_crop_latents(latents: torch.Tensor, target_count: int):
+        target_count = int(target_count)
+        if target_count <= 0:
+            return latents[:, :, :0]
+        if latents.shape[2] > target_count:
+            latents = latents[:, :, -target_count:]
+        if latents.shape[2] < target_count:
+            padding = latents.new_zeros(
+                latents.shape[0],
+                latents.shape[1],
+                target_count - latents.shape[2],
+                latents.shape[3],
+                latents.shape[4],
+            )
+            latents = torch.cat([padding, latents], dim=2)
+        return latents
+
+    @staticmethod
+    def _zero_history_latents(pipe: WanWorldModelPipeline, target_count: int, height: int, width: int):
+        return torch.zeros(
+            (
+                1,
+                pipe.vae.model.z_dim,
+                target_count,
+                height // pipe.vae.upsampling_factor,
+                width // pipe.vae.upsampling_factor,
+            ),
+            dtype=pipe.torch_dtype,
+            device=pipe.device,
+        )
+
+    def process(
+        self,
+        pipe: WanWorldModelPipeline,
+        history_video,
+        history_latents,
+        history_latent_count,
+        height,
+        width,
+        tiled,
+        tile_size,
+        tile_stride,
+    ):
+        target_count = self._as_int(history_latent_count, default=0)
+        if target_count < 0:
+            raise ValueError(f"`history_latent_count` must be non-negative, got {target_count}.")
+
+        if history_latents is not None:
+            if history_latents.ndim == 4:
+                history_latents = history_latents.unsqueeze(0)
+            if history_latents.ndim != 5:
+                raise ValueError(
+                    f"`history_latents` must have shape [B, C, T, H, W] or [C, T, H, W], "
+                    f"got {tuple(history_latents.shape)}."
+                )
+            if target_count == 0:
+                target_count = int(history_latents.shape[2])
+            history_latents = history_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
+            available_count = min(int(history_latents.shape[2]), target_count)
+            history_latents = self._pad_or_crop_latents(history_latents, target_count)
+            return {
+                "history_latents": history_latents,
+                "history_latent_count": target_count,
+                "available_history_latent_count": available_count,
+                "history_frame_count_used": available_count * 4,
+            }
+
+        history_video = [] if history_video is None else list(history_video)
+        if target_count == 0:
+            if len(history_video) == 0:
+                return {
+                    "history_latent_count": 0,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+            target_count = len(history_video) // 4
+
+        if target_count == 0:
+            return {
+                "history_latent_count": 0,
+                "available_history_latent_count": 0,
+                "history_frame_count_used": 0,
+            }
+
+        used_frame_count = min(len(history_video), target_count * 4)
+        used_frame_count = (used_frame_count // 4) * 4
+        if used_frame_count == 0:
+            history_latents = self._zero_history_latents(pipe, target_count, height, width)
+            return {
+                "history_latents": history_latents,
+                "history_latent_count": target_count,
+                "available_history_latent_count": 0,
+                "history_frame_count_used": 0,
+            }
+
+        pipe.load_models_to_device(self.onload_model_names)
+        history_video = [image.resize((width, height)) for image in history_video[-used_frame_count:]]
+        dummy_frame = Image.new("RGB", (width, height), (0, 0, 0))
+        history_video = pipe.preprocess_video([dummy_frame] + history_video)
+        history_latents = pipe.vae.encode(
+            history_video,
+            device=pipe.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        ).to(dtype=pipe.torch_dtype, device=pipe.device)
+        history_latents = history_latents[:, :, 1:]
+        available_count = int(history_latents.shape[2])
+        history_latents = self._pad_or_crop_latents(history_latents, target_count)
+        return {
+            "history_latents": history_latents,
+            "history_latent_count": target_count,
+            "available_history_latent_count": available_count,
+            "history_frame_count_used": used_frame_count,
+        }
+
+
 class WanWorldModelUnit_PromptEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
@@ -447,7 +620,14 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
-            input_params=("action", "num_frames"),
+            input_params=(
+                "action",
+                "history_action",
+                "num_frames",
+                "history_latent_count",
+                "available_history_latent_count",
+                "history_frame_count_used",
+            ),
             input_params_posi={"context": "context"},
             input_params_nega={"context": "context"},
             output_params=("context", "action_emb"),
@@ -581,20 +761,17 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
             dim=1,
         )
 
-    def process(self, pipe: WanWorldModelPipeline, action, num_frames, context) -> dict:
+    @classmethod
+    def _prepare_normalized_action(cls, pipe: WanWorldModelPipeline, action):
         if action is None:
-            return {}
-        injection_method = normalize_action_injection_method(pipe.action_injection_method)
-        if injection_method == "none":
-            return {}
-        if pipe.action_embedder is None:
-            raise ValueError("Action conditioning requires `action_dim` when building WanWorldModelPipeline.")
-
-        action = self._prepare_action(action).to(device=pipe.device)
+            return None
+        action = cls._prepare_action(action).to(device=pipe.device)
         if action.shape[-1] != pipe.action_dim:
             raise ValueError(f"`action` last dimension is {action.shape[-1]}, but pipeline action_dim is {pipe.action_dim}.")
-        action = self._normalize_action(pipe, action)
+        return cls._normalize_action(pipe, action)
 
+    @staticmethod
+    def _match_context_batch(action: torch.Tensor, context: torch.Tensor):
         if action.shape[0] != context.shape[0]:
             if action.shape[0] == 1:
                 action = action.expand(context.shape[0], -1, -1)
@@ -604,16 +781,101 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
                 raise ValueError(
                     f"Action batch size {action.shape[0]} does not match context batch size {context.shape[0]}."
                 )
+        return action, context
+
+    @staticmethod
+    def _match_history_action_batch(history_action: torch.Tensor, action: torch.Tensor, context: torch.Tensor):
+        if history_action.shape[0] == action.shape[0]:
+            return history_action, action, context
+        if history_action.shape[0] == 1:
+            history_action = history_action.expand(action.shape[0], -1, -1)
+            return history_action, action, context
+        if action.shape[0] == 1:
+            action = action.expand(history_action.shape[0], -1, -1)
+            if context.shape[0] == 1:
+                context = context.expand(history_action.shape[0], -1, -1)
+            elif context.shape[0] != history_action.shape[0]:
+                raise ValueError(
+                    f"Context batch size {context.shape[0]} does not match history action batch size {history_action.shape[0]}."
+                )
+            return history_action, action, context
+        raise ValueError(
+            f"`history_action` batch size {history_action.shape[0]} does not match action batch size {action.shape[0]}."
+        )
+
+    @staticmethod
+    def _as_int(value, default=0):
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            return int(value.detach().flatten()[0].item())
+        return int(value)
+
+    def process(
+        self,
+        pipe: WanWorldModelPipeline,
+        action,
+        history_action,
+        num_frames,
+        history_latent_count,
+        available_history_latent_count,
+        history_frame_count_used,
+        context,
+    ) -> dict:
+        if action is None:
+            return {}
+        injection_method = normalize_action_injection_method(pipe.action_injection_method)
+        if injection_method == "none":
+            return {}
+        if pipe.action_embedder is None:
+            raise ValueError("Action conditioning requires `action_dim` when building WanWorldModelPipeline.")
+
+        action = self._prepare_normalized_action(pipe, action)
+        action, context = self._match_context_batch(action, context)
+        target_history_latents = self._as_int(history_latent_count, default=0)
+        available_history_latents = self._as_int(available_history_latent_count, default=0)
+        used_history_frames = self._as_int(history_frame_count_used, default=0)
+
+        history_action_latents = 0
+        if history_action is not None and used_history_frames > 0 and available_history_latents > 0:
+            history_action = self._prepare_normalized_action(pipe, history_action)
+            history_action, action, context = self._match_history_action_batch(history_action, action, context)
+            usable_history_frames = min(history_action.shape[1], used_history_frames)
+            usable_history_frames = (usable_history_frames // 4) * 4
+            history_action_latents = min(available_history_latents, usable_history_frames // 4)
+            if history_action_latents > 0:
+                usable_history_frames = history_action_latents * 4
+                history_action = history_action[:, -usable_history_frames:]
+            else:
+                history_action = None
+        else:
+            history_action = None
 
         pipe.action_embedder.to(device=pipe.device)
         if injection_method != "context":
             frame_count = self._latent_frame_count(num_frames)
+            if history_action is not None:
+                action = torch.cat([history_action, action], dim=1)
+                frame_count = history_action_latents + frame_count
             action_emb = self._embed_latent_aligned_action(pipe, action, frame_count)
+            missing_history_latents = max(0, target_history_latents - history_action_latents)
+            if missing_history_latents > 0:
+                action_emb = torch.cat(
+                    [
+                        action_emb.new_zeros(action_emb.shape[0], missing_history_latents, action_emb.shape[-1]),
+                        action_emb,
+                    ],
+                    dim=1,
+                )
             return {
                 "context": context,
                 "action_emb": action_emb,
             }
 
+        if history_action is not None:
+            action = torch.cat([history_action, action], dim=1)
         action = action.to(dtype=self._action_embedder_dtype(pipe))
         action_emb = pipe.action_embedder(action)
         action_emb = torch.cat(
