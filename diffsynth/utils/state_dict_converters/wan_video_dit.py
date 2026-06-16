@@ -1,3 +1,21 @@
+import torch
+
+
+def _maybe_add_view_embedding(state_dict, max_video_views=16):
+    if "view_embedding.weight" in state_dict:
+        return state_dict
+    reference_weight = state_dict.get("patch_embedding.weight")
+    if not isinstance(reference_weight, torch.Tensor):
+        return state_dict
+    state_dict["view_embedding.weight"] = torch.zeros(
+        max_video_views,
+        reference_weight.shape[0],
+        dtype=reference_weight.dtype,
+        device=reference_weight.device,
+    )
+    return state_dict
+
+
 def WanVideoDiTFromDiffusers(state_dict):
     rename_dict = {
         "blocks.0.attn1.norm_k.weight": "blocks.0.self_attn.norm_k.weight",
@@ -66,7 +84,7 @@ def WanVideoDiTFromDiffusers(state_dict):
                 name_ = rename_dict[name_]
                 name_ = ".".join(name_.split(".")[:1] + [name.split(".")[1]] + name_.split(".")[2:])
                 state_dict_[name_] = state_dict[name]
-    return state_dict_
+    return _maybe_add_view_embedding(state_dict_)
 
 
 def WanVideoDiTStateDictConverter(state_dict):
@@ -80,4 +98,4 @@ def WanVideoDiTStateDictConverter(state_dict):
         if name_.startswith("model."):
             name_ = name_[len("model."):]
         state_dict_[name_] = state_dict[name]
-    return state_dict_
+    return _maybe_add_view_embedding(state_dict_)

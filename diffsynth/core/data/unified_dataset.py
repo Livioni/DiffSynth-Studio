@@ -1,4 +1,5 @@
 from .operators import *
+import os
 import torch, json, pandas
 
 
@@ -22,6 +23,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.max_data_items = max_data_items
         self.data = []
         self.cached_data = []
+        self.cached_sample_weights = None
         self.load_from_cache = metadata_path is None
         self.load_metadata(metadata_path)
     
@@ -60,6 +62,45 @@ class UnifiedDataset(torch.utils.data.Dataset):
             ])),
         ])
         
+    def search_for_cache_manifests(self, path):
+        manifests = []
+        for file_name in os.listdir(path):
+            subpath = os.path.join(path, file_name)
+            if os.path.isdir(subpath):
+                manifests.extend(self.search_for_cache_manifests(subpath))
+            elif file_name == "manifest.jsonl":
+                manifests.append(subpath)
+        return sorted(manifests)
+
+    def load_cached_data_manifests(self, path):
+        manifests = self.search_for_cache_manifests(path)
+        if len(manifests) == 0:
+            return False
+
+        cached_data = []
+        cached_sample_weights = []
+        has_sample_weights = False
+        for manifest_path in manifests:
+            manifest_dir = os.path.dirname(manifest_path)
+            with open(manifest_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    data_path = item.get("path")
+                    if data_path is None:
+                        continue
+                    if not os.path.isabs(data_path):
+                        data_path = os.path.join(manifest_dir, data_path)
+                    cached_data.append(data_path)
+                    sample_weight = item.get("sample_weight")
+                    cached_sample_weights.append(1.0 if sample_weight is None else float(sample_weight))
+                    has_sample_weights = has_sample_weights or sample_weight is not None
+        self.cached_data = cached_data
+        self.cached_sample_weights = cached_sample_weights if has_sample_weights else None
+        return True
+
     def search_for_cached_data_files(self, path):
         for file_name in os.listdir(path):
             subpath = os.path.join(path, file_name)
@@ -71,8 +112,13 @@ class UnifiedDataset(torch.utils.data.Dataset):
     def load_metadata(self, metadata_path):
         if metadata_path is None:
             print("No metadata_path. Searching for cached data files.")
-            self.search_for_cached_data_files(self.base_path)
-            print(f"{len(self.cached_data)} cached data files found.")
+            loaded_manifest = self.load_cached_data_manifests(self.base_path)
+            if loaded_manifest:
+                print(f"{len(self.cached_data)} cached data files found from manifests.")
+            else:
+                self.search_for_cached_data_files(self.base_path)
+                self.cached_data = sorted(self.cached_data)
+                print(f"{len(self.cached_data)} cached data files found.")
         elif metadata_path.endswith(".json"):
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
@@ -100,6 +146,15 @@ class UnifiedDataset(torch.utils.data.Dataset):
                     elif key in self.data_file_keys:
                         data[key] = self.main_data_operator(data[key])
         return data
+
+    @property
+    def sample_weights(self):
+        if self.cached_sample_weights is None:
+            return None
+        weights = self.cached_sample_weights * max(int(self.repeat), 0)
+        if self.max_data_items is not None:
+            weights = weights[:int(self.max_data_items)]
+        return weights
 
     def __len__(self):
         if self.max_data_items is not None:

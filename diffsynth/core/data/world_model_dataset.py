@@ -140,6 +140,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
             "retained_windows": 0,
             "low_delta_weighted_windows": 0,
         }
+        self._frame_file_cache = {}
         self._build_index()
 
     @staticmethod
@@ -375,6 +376,14 @@ class WorldModelDataset(torch.utils.data.Dataset):
                 files_by_frame[frame_key] = path
         return sorted(files_by_frame.values(), key=self._frame_sort_key)
 
+    def _get_frame_files(self, folder, extensions):
+        key = (folder, tuple(extensions))
+        files = self._frame_file_cache.get(key)
+        if files is None:
+            files = self._list_frame_files(folder, extensions)
+            self._frame_file_cache[key] = files
+        return files
+
     def _robot_paths(self, episode_path):
         robot_root = os.path.join(episode_path, "robot_data")
         paths = {}
@@ -406,14 +415,14 @@ class WorldModelDataset(torch.utils.data.Dataset):
         lengths = []
 
         rgb_folder = os.path.join(camera_root, "images", camera)
-        rgb_files = self._list_frame_files(rgb_folder, self.rgb_extensions)
+        rgb_files = self._get_frame_files(rgb_folder, self.rgb_extensions)
         if not rgb_files:
             return None
         lengths.append(len(rgb_files))
 
         if self.include_depth:
             depth_folder = os.path.join(camera_root, "depths", camera)
-            depth_files = self._list_frame_files(depth_folder, self.depth_extensions)
+            depth_files = self._get_frame_files(depth_folder, self.depth_extensions)
             if not depth_files:
                 return None
             lengths.append(len(depth_files))
@@ -423,7 +432,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
             if not os.path.isfile(intrinsic_path):
                 return None
             extrinsic_folder = os.path.join(camera_root, "extrinsics", camera)
-            extrinsic_files = self._list_frame_files(extrinsic_folder, (".npy",))
+            extrinsic_files = self._get_frame_files(extrinsic_folder, (".npy",))
             if not extrinsic_files:
                 return None
             lengths.append(len(extrinsic_files))
@@ -477,7 +486,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
 
     def _load_rgb_window(self, episode_path, camera, frame_indices):
         folder = os.path.join(episode_path, "camera_data", "images", camera)
-        files = self._list_frame_files(folder, self.rgb_extensions)
+        files = self._get_frame_files(folder, self.rgb_extensions)
         frames = []
         for frame_index in frame_indices:
             with Image.open(files[int(frame_index)]) as image:
@@ -486,7 +495,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
 
     def _load_depth_window(self, episode_path, camera, frame_indices):
         folder = os.path.join(episode_path, "camera_data", "depths", camera)
-        files = self._list_frame_files(folder, self.depth_extensions)
+        files = self._get_frame_files(folder, self.depth_extensions)
         depth_frames = []
         for frame_index in frame_indices:
             path = files[int(frame_index)]
@@ -504,7 +513,7 @@ class WorldModelDataset(torch.utils.data.Dataset):
         intrinsic = torch.from_numpy(np.load(intrinsic_path)).to(dtype=torch.float32)
 
         extrinsic_folder = os.path.join(camera_root, "extrinsics", camera)
-        extrinsic_files = self._list_frame_files(extrinsic_folder, (".npy",))
+        extrinsic_files = self._get_frame_files(extrinsic_folder, (".npy",))
         extrinsics = []
         for frame_index in frame_indices:
             extrinsic = np.load(extrinsic_files[int(frame_index)])

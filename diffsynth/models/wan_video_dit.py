@@ -91,6 +91,64 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
+def validate_num_video_views(num_video_views, h=None, max_video_views=None):
+    num_video_views = int(num_video_views or 1)
+    if num_video_views < 1:
+        raise ValueError(f"`num_video_views` must be positive, got {num_video_views}.")
+    if max_video_views is not None and num_video_views > max_video_views:
+        raise ValueError(
+            f"`num_video_views`={num_video_views} exceeds model max_video_views={max_video_views}."
+        )
+    if h is not None and h % num_video_views != 0:
+        raise ValueError(
+            f"Patched latent height h={h} must be divisible by num_video_views={num_video_views}."
+        )
+    return num_video_views
+
+
+def build_wan_video_freqs(freqs, f, h, w, device, num_video_views=1, frame_freqs=None):
+    num_video_views = validate_num_video_views(num_video_views, h=h)
+    frame_freqs = freqs[0][:f] if frame_freqs is None else frame_freqs
+    if num_video_views == 1:
+        return torch.cat([
+            frame_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(device)
+
+    per_view_h = h // num_video_views
+    return torch.cat([
+        frame_freqs.view(f, 1, 1, 1, -1).expand(f, num_video_views, per_view_h, w, -1),
+        freqs[1][:per_view_h].view(1, 1, per_view_h, 1, -1).expand(f, num_video_views, per_view_h, w, -1),
+        freqs[2][:w].view(1, 1, 1, w, -1).expand(f, num_video_views, per_view_h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(device)
+
+
+def add_wan_video_view_embeddings(dit, x, f, h, w, num_video_views=1):
+    if dit.view_embedding.weight.is_meta:
+        dit.view_embedding = nn.Embedding(
+            dit.view_embedding.num_embeddings,
+            dit.view_embedding.embedding_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        nn.init.zeros_(dit.view_embedding.weight)
+    num_video_views = validate_num_video_views(
+        num_video_views,
+        h=h,
+        max_video_views=dit.view_embedding.num_embeddings,
+    )
+    if num_video_views == 1:
+        return x
+    per_view_h = h // num_video_views
+    view_ids = torch.arange(num_video_views, device=x.device)
+    view_emb = dit.view_embedding(view_ids).to(dtype=x.dtype, device=x.device)
+    view_emb = view_emb.view(1, 1, num_video_views, 1, 1, x.shape[-1])
+    view_emb = view_emb.expand(x.shape[0], f, num_video_views, per_view_h, w, x.shape[-1])
+    view_emb = view_emb.reshape(x.shape[0], f * h * w, x.shape[-1])
+    return x + view_emb
+
+
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
@@ -489,6 +547,7 @@ class WanModel(torch.nn.Module):
         wantodance_enable_global: bool = False,
         wantodance_enable_dynamicfps: bool = False,
         wantodance_enable_unimodel: bool = False,
+        max_video_views: int = 16,
     ):
         super().__init__()
         self.dim = dim
@@ -501,6 +560,11 @@ class WanModel(torch.nn.Module):
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
+        self.max_video_views = int(max_video_views)
+        if self.max_video_views < 1:
+            raise ValueError(f"`max_video_views` must be positive, got {self.max_video_views}.")
+        self.view_embedding = nn.Embedding(self.max_video_views, dim)
+        nn.init.zeros_(self.view_embedding.weight)
 
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -544,6 +608,40 @@ class WanModel(torch.nn.Module):
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
                                 wantodance_enable_global, wantodance_enable_dynamicfps, wantodance_enable_unimodel)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        view_embedding_key = prefix + "view_embedding.weight"
+        if view_embedding_key not in state_dict:
+            reference_key = prefix + "patch_embedding.weight"
+            reference_weight = state_dict.get(reference_key)
+            dtype = reference_weight.dtype if isinstance(reference_weight, torch.Tensor) else self.view_embedding.weight.dtype
+            device = reference_weight.device if isinstance(reference_weight, torch.Tensor) else self.view_embedding.weight.device
+            if device.type == "meta":
+                device = torch.device("cpu")
+            state_dict[view_embedding_key] = torch.zeros(
+                self.max_video_views,
+                self.dim,
+                dtype=dtype,
+                device=device,
+            )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def action_embedding_dim(self, method: Optional[str] = None):
         method = normalize_action_injection_method(method or self.action_injection_method)
@@ -661,6 +759,7 @@ class WanModel(torch.nn.Module):
                 disable_context_attention: bool = False,
                 **kwargs,
                 ):
+        num_video_views = kwargs.get("num_video_views", 1)
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
@@ -675,13 +774,12 @@ class WanModel(torch.nn.Module):
                 clip_embdding = self.img_emb(clip_feature)
                 context = torch.cat([clip_embdding, context], dim=1)
         
-        x, (f, h, w) = self.patchify(x)
+        x = self.patchify(x)
+        f, h, w = x.shape[2:]
+        x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
+        x = add_wan_video_view_embeddings(self, x, f, h, w, num_video_views=num_video_views)
         
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        freqs = build_wan_video_freqs(self.freqs, f, h, w, x.device, num_video_views=num_video_views)
 
         for block in self.blocks:
             block.disable_context_attention = disable_context_attention

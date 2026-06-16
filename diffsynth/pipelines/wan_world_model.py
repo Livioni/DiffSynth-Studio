@@ -25,6 +25,44 @@ def normalize_action_normalization_mode(mode: str = "standard"):
     return mode
 
 
+def compose_frame_views(frames):
+    if len(frames) == 0:
+        raise ValueError("Cannot compose zero camera views.")
+    heights = [frame.size[1] for frame in frames]
+    if len(set(heights)) != 1:
+        raise ValueError(f"All view heights must match, got {heights}.")
+    width = sum(frame.size[0] for frame in frames)
+    height = heights[0]
+    canvas = Image.new("RGB", (width, height))
+    offset = 0
+    for frame in frames:
+        canvas.paste(frame.convert("RGB"), (offset, 0))
+        offset += frame.size[0]
+    return canvas
+
+
+def compose_video_views(video_views):
+    if len(video_views) == 0:
+        raise ValueError("Cannot compose zero camera video views.")
+    frame_count = len(video_views[0])
+    if any(len(video) != frame_count for video in video_views):
+        lengths = [len(video) for video in video_views]
+        raise ValueError(f"All video views must have the same frame count, got {lengths}.")
+    return [
+        compose_frame_views([video[frame_id] for video in video_views])
+        for frame_id in range(frame_count)
+    ]
+
+
+def multiview_frame_height(height, num_views):
+    num_views = int(num_views or 1)
+    if num_views <= 1:
+        return int(height)
+    if int(height) % num_views != 0:
+        raise ValueError(f"`height` must be divisible by num_video_views={num_views}, got {height}.")
+    return int(height) // num_views
+
+
 class WanWorldModelActionEmbedder(torch.nn.Module):
     """
     Embed per-frame robot actions into the conditioning space required by the selected injection method.
@@ -292,6 +330,7 @@ class WanWorldModelPipeline(BasePipeline):
         prompt: str = "",
         negative_prompt: str = "",
         input_image: Image.Image = None,
+        input_image_views: list[Image.Image] = None,
         seed: int = None,
         rand_device: str = "cpu",
         height: int = 704,
@@ -307,6 +346,8 @@ class WanWorldModelPipeline(BasePipeline):
         action: Union[torch.Tensor, list, tuple, dict] = None,
         history_video: list[Image.Image] = None,
         history_video_segments: list[list[Image.Image]] = None,
+        history_video_views: list[list[Image.Image]] = None,
+        history_video_segments_views: list[list[list[Image.Image]]] = None,
         history_latents: torch.Tensor = None,
         history_action: Union[torch.Tensor, list, tuple, dict] = None,
         history_latent_count: int = 0,
@@ -317,8 +358,14 @@ class WanWorldModelPipeline(BasePipeline):
 
         inputs_posi = {"prompt": prompt}
         inputs_nega = {"prompt": negative_prompt}
+        num_video_views = 1
+        for video_views in (input_image_views, history_video_views, history_video_segments_views):
+            if video_views is not None:
+                num_video_views = len(video_views)
+                break
         inputs_shared = {
             "input_image": input_image,
+            "input_image_views": input_image_views,
             "seed": seed,
             "rand_device": rand_device,
             "height": height,
@@ -331,9 +378,12 @@ class WanWorldModelPipeline(BasePipeline):
             "action": action,
             "history_video": history_video,
             "history_video_segments": history_video_segments,
+            "history_video_views": history_video_views,
+            "history_video_segments_views": history_video_segments_views,
             "history_latents": history_latents,
             "history_action": history_action,
             "history_latent_count": history_latent_count,
+            "num_video_views": num_video_views,
             "disable_context_attention": not self.use_text_condition,
         }
         for unit in self.units:
@@ -369,9 +419,27 @@ class WanWorldModelPipeline(BasePipeline):
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
 
         self.load_models_to_device(["vae"])
-        video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        if output_type == "quantized":
-            video = self.vae_output_to_video(video)
+        num_video_views = int(inputs_shared.get("num_video_views") or 1)
+        if num_video_views > 1:
+            view_latents = torch.chunk(inputs_shared["latents"], num_video_views, dim=3)
+            decoded_views = [
+                self.vae.decode(
+                    latents,
+                    device=self.device,
+                    tiled=tiled,
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                )
+                for latents in view_latents
+            ]
+            if output_type == "quantized":
+                video = compose_video_views([self.vae_output_to_video(decoded) for decoded in decoded_views])
+            else:
+                video = torch.cat(decoded_views, dim=4)
+        else:
+            video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            if output_type == "quantized":
+                video = self.vae_output_to_video(video)
         self.load_models_to_device([])
         return video
 
@@ -411,28 +479,44 @@ class WanWorldModelUnit_NoiseInitializer(PipelineUnit):
 class WanWorldModelUnit_InputVideoEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_video", "noise", "height", "width", "tiled", "tile_size", "tile_stride"),
-            output_params=("latents", "input_latents"),
+            input_params=("input_video", "input_video_views", "noise", "height", "width", "tiled", "tile_size", "tile_stride"),
+            output_params=("latents", "input_latents", "num_video_views"),
             onload_model_names=("vae",),
         )
 
-    def process(self, pipe: WanWorldModelPipeline, input_video, noise, height, width, tiled, tile_size, tile_stride):
-        if input_video is None:
-            return {"latents": noise}
-        pipe.load_models_to_device(self.onload_model_names)
-        input_video = [image.resize((width, height)) for image in input_video]
-        input_video = pipe.preprocess_video(input_video)
-        input_latents = pipe.vae.encode(
-            input_video,
+    @staticmethod
+    def _encode_video(pipe, video, height, width, tiled, tile_size, tile_stride):
+        video = [image.resize((width, height)) for image in video]
+        video = pipe.preprocess_video(video)
+        return pipe.vae.encode(
+            video,
             device=pipe.device,
             tiled=tiled,
             tile_size=tile_size,
             tile_stride=tile_stride,
         ).to(dtype=pipe.torch_dtype, device=pipe.device)
+
+    def process(self, pipe: WanWorldModelPipeline, input_video, input_video_views, noise, height, width, tiled, tile_size, tile_stride):
+        if input_video is None and input_video_views is None:
+            return {"latents": noise}
+        pipe.load_models_to_device(self.onload_model_names)
+        num_video_views = 1
+        if input_video_views is not None:
+            num_video_views = len(input_video_views)
+            view_height = multiview_frame_height(height, num_video_views)
+            input_latents = torch.cat(
+                [
+                    self._encode_video(pipe, view_video, view_height, width, tiled, tile_size, tile_stride)
+                    for view_video in input_video_views
+                ],
+                dim=3,
+            )
+        else:
+            input_latents = self._encode_video(pipe, input_video, height, width, tiled, tile_size, tile_stride)
         if pipe.scheduler.training:
-            return {"latents": noise, "input_latents": input_latents}
+            return {"latents": noise, "input_latents": input_latents, "num_video_views": num_video_views}
         latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
-        return {"latents": latents}
+        return {"latents": latents, "num_video_views": num_video_views}
 
 
 class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
@@ -441,6 +525,8 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
             input_params=(
                 "history_video",
                 "history_video_segments",
+                "history_video_views",
+                "history_video_segments_views",
                 "history_latents",
                 "history_latent_count",
                 "height",
@@ -514,11 +600,30 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
         ).to(dtype=pipe.torch_dtype, device=pipe.device)
         return history_latents[:, :, 1:]
 
+    @classmethod
+    def _encode_history_video_views(cls, pipe, history_video_views, height, width, tiled, tile_size, tile_stride):
+        num_video_views = len(history_video_views)
+        if num_video_views == 0:
+            raise ValueError("`history_video_views` must contain at least one view.")
+        frame_counts = [len(video) for video in history_video_views]
+        if len(set(frame_counts)) != 1:
+            raise ValueError(f"All history video views must have the same frame count, got {frame_counts}.")
+        view_height = multiview_frame_height(height, num_video_views)
+        return torch.cat(
+            [
+                cls._encode_history_video(pipe, history_video, view_height, width, tiled, tile_size, tile_stride)
+                for history_video in history_video_views
+            ],
+            dim=3,
+        )
+
     def process(
         self,
         pipe: WanWorldModelPipeline,
         history_video,
         history_video_segments,
+        history_video_views,
+        history_video_segments_views,
         history_latents,
         history_latent_count,
         height,
@@ -549,6 +654,69 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
                 "history_latent_count": target_count,
                 "available_history_latent_count": available_count,
                 "history_frame_count_used": available_count * 4,
+            }
+
+        if history_video_segments_views is not None:
+            history_video_segments_views = [
+                [list(segment) for segment in view_segments if len(segment) >= 4]
+                for view_segments in history_video_segments_views
+            ]
+            if len(history_video_segments_views) == 0:
+                raise ValueError("`history_video_segments_views` must contain at least one view.")
+            segment_counts = [len(view_segments) for view_segments in history_video_segments_views]
+            if len(set(segment_counts)) != 1:
+                raise ValueError(f"All history segment views must have the same segment count, got {segment_counts}.")
+            if target_count == 0:
+                target_count = segment_counts[0]
+
+            if target_count == 0:
+                return {
+                    "history_latent_count": 0,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+
+            pipe.load_models_to_device(self.onload_model_names)
+            selected_segments = [view_segments[-target_count:] for view_segments in history_video_segments_views]
+            encoded_segments = []
+            used_frame_count = 0
+            for segment_id in range(len(selected_segments[0])):
+                segment_views = [view_segments[segment_id] for view_segments in selected_segments]
+                segment_frame_counts = [(len(segment) // 4) * 4 for segment in segment_views]
+                if len(set(segment_frame_counts)) != 1:
+                    raise ValueError(f"All views in a history segment must have the same frame count, got {segment_frame_counts}.")
+                segment_frame_count = segment_frame_counts[0]
+                if segment_frame_count == 0:
+                    continue
+                segment_latents = self._encode_history_video_views(
+                    pipe,
+                    [segment[-segment_frame_count:] for segment in segment_views],
+                    height,
+                    width,
+                    tiled,
+                    tile_size,
+                    tile_stride,
+                )
+                encoded_segments.append(segment_latents)
+                used_frame_count += int(segment_latents.shape[2]) * 4
+
+            if len(encoded_segments) == 0:
+                history_latents = self._zero_history_latents(pipe, target_count, height, width)
+                return {
+                    "history_latents": history_latents,
+                    "history_latent_count": target_count,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+
+            history_latents = torch.cat(encoded_segments, dim=2)
+            available_count = int(history_latents.shape[2])
+            history_latents = self._pad_or_crop_latents(history_latents, target_count)
+            return {
+                "history_latents": history_latents,
+                "history_latent_count": target_count,
+                "available_history_latent_count": available_count,
+                "history_frame_count_used": used_frame_count,
             }
 
         if history_video_segments is not None:
@@ -592,6 +760,57 @@ class WanWorldModelUnit_HistoryEmbedder(PipelineUnit):
                 }
 
             history_latents = torch.cat(encoded_segments, dim=2)
+            available_count = int(history_latents.shape[2])
+            history_latents = self._pad_or_crop_latents(history_latents, target_count)
+            return {
+                "history_latents": history_latents,
+                "history_latent_count": target_count,
+                "available_history_latent_count": available_count,
+                "history_frame_count_used": used_frame_count,
+            }
+
+        if history_video_views is not None:
+            history_video_views = [list(history_video) for history_video in history_video_views]
+            if target_count == 0:
+                if len(history_video_views) == 0 or len(history_video_views[0]) == 0:
+                    return {
+                        "history_latent_count": 0,
+                        "available_history_latent_count": 0,
+                        "history_frame_count_used": 0,
+                    }
+                target_count = len(history_video_views[0]) // 4
+
+            if target_count == 0:
+                return {
+                    "history_latent_count": 0,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+
+            frame_counts = [len(history_video) for history_video in history_video_views]
+            if len(set(frame_counts)) != 1:
+                raise ValueError(f"All history video views must have the same frame count, got {frame_counts}.")
+            used_frame_count = min(frame_counts[0], target_count * 4)
+            used_frame_count = (used_frame_count // 4) * 4
+            if used_frame_count == 0:
+                history_latents = self._zero_history_latents(pipe, target_count, height, width)
+                return {
+                    "history_latents": history_latents,
+                    "history_latent_count": target_count,
+                    "available_history_latent_count": 0,
+                    "history_frame_count_used": 0,
+                }
+
+            pipe.load_models_to_device(self.onload_model_names)
+            history_latents = self._encode_history_video_views(
+                pipe,
+                [history_video[-used_frame_count:] for history_video in history_video_views],
+                height,
+                width,
+                tiled,
+                tile_size,
+                tile_stride,
+            )
             available_count = int(history_latents.shape[2])
             history_latents = self._pad_or_crop_latents(history_latents, target_count)
             return {
@@ -969,17 +1188,32 @@ class WanWorldModelUnit_ActionEmbedder(PipelineUnit):
 class WanWorldModelUnit_InputImageEmbedderFused(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
+            input_params=("input_image", "input_image_views", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
             output_params=("latents", "fuse_vae_embedding_in_latents", "first_frame_latents"),
             onload_model_names=("vae",),
         )
 
-    def process(self, pipe: WanWorldModelPipeline, input_image, latents, height, width, tiled, tile_size, tile_stride):
-        if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents:
+    @staticmethod
+    def _encode_image(pipe, image, height, width, tiled, tile_size, tile_stride):
+        image = pipe.preprocess_image(image.resize((width, height))).transpose(0, 1)
+        return pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+
+    def process(self, pipe: WanWorldModelPipeline, input_image, input_image_views, latents, height, width, tiled, tile_size, tile_stride):
+        if (input_image is None and input_image_views is None) or not pipe.dit.fuse_vae_embedding_in_latents:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
-        first_frame_latents = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        if input_image_views is not None:
+            num_video_views = len(input_image_views)
+            view_height = multiview_frame_height(height, num_video_views)
+            first_frame_latents = torch.cat(
+                [
+                    self._encode_image(pipe, image, view_height, width, tiled, tile_size, tile_stride)
+                    for image in input_image_views
+                ],
+                dim=3,
+            )
+        else:
+            first_frame_latents = self._encode_image(pipe, input_image, height, width, tiled, tile_size, tile_stride)
         latents[:, :, 0:1] = first_frame_latents
         return {
             "latents": latents,

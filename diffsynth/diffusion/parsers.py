@@ -6,6 +6,8 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--dataset_prefetch_factor", type=int, default=2, help="Number of samples prefetched by each DataLoader worker when workers are enabled.")
+    parser.add_argument("--disable_dataset_persistent_workers", default=False, action="store_true", help="Disable persistent DataLoader workers when --dataset_num_workers > 0.")
     parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")
     return parser
 

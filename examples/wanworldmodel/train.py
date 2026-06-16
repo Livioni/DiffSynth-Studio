@@ -123,17 +123,23 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
         self,
         dataset,
         video_camera="head_camera",
+        multiview_cameras=None,
         frame_processor=None,
         history_frames=0,
         history_stride=4,
         history_dropout_prob=0.0,
+        use_history_action=True,
     ):
         self.dataset = dataset
-        self.video_camera = video_camera
+        video_cameras = split_csv(video_camera) or (video_camera,)
+        self.video_camera = video_cameras[0]
+        self.multiview_cameras = tuple(multiview_cameras or (video_cameras if len(video_cameras) > 1 else ()))
         self.frame_processor = frame_processor
         self.history_frames = validate_world_model_history_frames(history_frames)
         self.history_stride = validate_world_model_history_stride(history_stride)
         self.history_dropout_prob = validate_probability(history_dropout_prob, "history_dropout_prob")
+        self.use_history_action = bool(use_history_action)
+        self._sample_weights = getattr(dataset, "sample_weights", None)
         self.load_from_cache = False
 
     def __len__(self):
@@ -141,7 +147,7 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
 
     @property
     def sample_weights(self):
-        return getattr(self.dataset, "sample_weights", None)
+        return self._sample_weights
 
     def sample_statistics(self):
         episodes = getattr(self.dataset, "episodes", None)
@@ -187,11 +193,13 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             "roots": getattr(self.dataset, "roots", ()),
             "cameras": getattr(self.dataset, "cameras", ()),
             "video_camera": self.video_camera,
+            "multiview_cameras": self.multiview_cameras,
             "num_frames": getattr(self.dataset, "num_frames", None),
             "stride": getattr(self.dataset, "stride", None),
             "history_frames": self.history_frames,
             "history_stride": self.history_stride,
             "history_dropout_prob": self.history_dropout_prob,
+            "use_history_action": self.use_history_action,
             "repeat": getattr(self.dataset, "repeat", None),
             "max_data_items": getattr(self.dataset, "max_data_items", None),
             "episode_count": len(episodes),
@@ -213,16 +221,55 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
                 continue
         return None
 
+    def _process_video(self, video):
+        if self.frame_processor is None:
+            return video
+        return [self.frame_processor(frame) for frame in video]
+
+    def _load_processed_rgb_window(self, episode_path, camera, frame_indices):
+        return self._process_video(self.dataset._load_rgb_window(episode_path, camera, frame_indices))
+
+    def _sample_weight(self, index):
+        if self._sample_weights is None or len(self._sample_weights) == 0:
+            return None
+        return float(self._sample_weights[index % len(self._sample_weights)])
+
+    def _video_camera_view_index(self):
+        if not self.multiview_cameras:
+            return None
+        try:
+            return self.multiview_cameras.index(self.video_camera)
+        except ValueError:
+            return None
+
     def __getitem__(self, index):
         data = self.dataset[index]
+        sample_weight = self._sample_weight(index)
+        if sample_weight is not None:
+            data["sample_weight"] = sample_weight
         if self.video_camera not in data["cameras"]:
             raise KeyError(
                 f"Camera `{self.video_camera}` is not available in sample "
                 f"{data['task']}/{data['episode']}. Available cameras: {list(data['cameras'])}"
             )
-        video = data["cameras"][self.video_camera]["rgb"]
-        if self.frame_processor is not None:
-            video = [self.frame_processor(frame) for frame in video]
+        if self.multiview_cameras:
+            missing_cameras = [camera for camera in self.multiview_cameras if camera not in data["cameras"]]
+            if missing_cameras:
+                raise KeyError(
+                    f"Multiview cameras {missing_cameras} are not available in sample "
+                    f"{data['task']}/{data['episode']}. Available cameras: {list(data['cameras'])}"
+                )
+            video_by_camera = {
+                camera: self._process_video(data["cameras"][camera]["rgb"])
+                for camera in self.multiview_cameras
+            }
+            data["video_views"] = [video_by_camera[camera] for camera in self.multiview_cameras]
+            data["input_image_views"] = [video[0] for video in data["video_views"]]
+            video = video_by_camera.get(self.video_camera)
+            if video is None:
+                video = self._process_video(data["cameras"][self.video_camera]["rgb"])
+        else:
+            video = self._process_video(data["cameras"][self.video_camera]["rgb"])
         data["video"] = video
         data["input_image"] = video[0]
         action = robot_action_to_tensor(data["robot"])
@@ -246,39 +293,89 @@ class WorldModelTrainingDataset(torch.utils.data.Dataset):
             if len(history_indices) > 0 and not drop_history:
                 if use_sparse_history:
                     history_video_segments = []
-                    history_action_segments = []
+                    history_video_segments_views = [[] for _ in self.multiview_cameras]
+                    history_action_segments = [] if self.use_history_action else None
+                    video_camera_view_index = self._video_camera_view_index()
                     for segment_indices in history_segments:
-                        history_video_segment = self.dataset._load_rgb_window(
-                            data["episode_path"],
-                            self.video_camera,
-                            segment_indices,
-                        )
-                        if self.frame_processor is not None:
-                            history_video_segment = [self.frame_processor(frame) for frame in history_video_segment]
+                        if self.multiview_cameras:
+                            segment_views = [
+                                self._load_processed_rgb_window(
+                                    data["episode_path"],
+                                    camera,
+                                    segment_indices,
+                                )
+                                for camera in self.multiview_cameras
+                            ]
+                            for view_id, history_video_segment_view in enumerate(segment_views):
+                                history_video_segments_views[view_id].append(history_video_segment_view)
+                            if video_camera_view_index is not None:
+                                history_video_segment = segment_views[video_camera_view_index]
+                            else:
+                                history_video_segment = self._load_processed_rgb_window(
+                                    data["episode_path"],
+                                    self.video_camera,
+                                    segment_indices,
+                                )
+                        else:
+                            history_video_segment = self._load_processed_rgb_window(
+                                data["episode_path"],
+                                self.video_camera,
+                                segment_indices,
+                            )
                         history_video_segments.append(history_video_segment)
-                        history_action = robot_action_to_tensor(
-                            self.dataset._load_robot_window(data["episode_path"], segment_indices)
-                        )
-                        if history_action is not None:
-                            history_action_segments.append(history_action)
+                        if self.use_history_action:
+                            history_action = robot_action_to_tensor(
+                                self.dataset._load_robot_window(data["episode_path"], segment_indices)
+                            )
+                            if history_action is not None:
+                                history_action_segments.append(history_action)
                     data["history_video_segments"] = history_video_segments
                     data["history_video"] = [frame for segment in history_video_segments for frame in segment]
-                    if len(history_action_segments) == len(history_video_segments):
+                    if self.multiview_cameras:
+                        data["history_video_segments_views"] = history_video_segments_views
+                        data["history_video_views"] = [
+                            [frame for segment in view_segments for frame in segment]
+                            for view_segments in history_video_segments_views
+                        ]
+                    if (
+                        self.use_history_action
+                        and len(history_action_segments) > 0
+                        and len(history_action_segments) == len(history_video_segments)
+                    ):
                         data["history_action"] = torch.cat(history_action_segments, dim=0)
                 else:
-                    history_video = self.dataset._load_rgb_window(
-                        data["episode_path"],
-                        self.video_camera,
-                        history_indices,
-                    )
-                    if self.frame_processor is not None:
-                        history_video = [self.frame_processor(frame) for frame in history_video]
+                    if self.multiview_cameras:
+                        history_video_views = [
+                            self._load_processed_rgb_window(
+                                data["episode_path"],
+                                camera,
+                                history_indices,
+                            )
+                            for camera in self.multiview_cameras
+                        ]
+                        data["history_video_views"] = history_video_views
+                        video_camera_view_index = self._video_camera_view_index()
+                        if video_camera_view_index is not None:
+                            history_video = history_video_views[video_camera_view_index]
+                        else:
+                            history_video = self._load_processed_rgb_window(
+                                data["episode_path"],
+                                self.video_camera,
+                                history_indices,
+                            )
+                    else:
+                        history_video = self._load_processed_rgb_window(
+                            data["episode_path"],
+                            self.video_camera,
+                            history_indices,
+                        )
                     data["history_video"] = history_video
-                    history_action = robot_action_to_tensor(
-                        self.dataset._load_robot_window(data["episode_path"], history_indices)
-                    )
-                    if history_action is not None:
-                        data["history_action"] = history_action
+                    if self.use_history_action:
+                        history_action = robot_action_to_tensor(
+                            self.dataset._load_robot_window(data["episode_path"], history_indices)
+                        )
+                        if history_action is not None:
+                            data["history_action"] = history_action
         return data
 
 
@@ -316,13 +413,16 @@ def print_world_model_training_dataset_summary(dataset, accelerator, label):
 
     roots = ", ".join(stats["roots"])
     cameras = ", ".join(stats["cameras"])
+    multiview_cameras = ", ".join(stats["multiview_cameras"]) if stats["multiview_cameras"] else "None"
     max_data_items = stats["max_data_items"] if stats["max_data_items"] is not None else "None"
     print(
         f"[WorldModelTrainingDataset:{label}] roots={roots}; cameras={cameras}; "
-        f"video_camera={stats['video_camera']}; num_frames={stats['num_frames']}; "
+        f"video_camera={stats['video_camera']}; multiview_cameras={multiview_cameras}; "
+        f"num_frames={stats['num_frames']}; "
         f"stride={stats['stride']}; history_frames={stats['history_frames']}; "
         f"history_stride={stats['history_stride']}; "
         f"history_dropout_prob={stats['history_dropout_prob']}; "
+        f"use_history_action={stats['use_history_action']}; "
         f"repeat={stats['repeat']}; max_data_items={max_data_items}"
     )
     print(
@@ -357,6 +457,30 @@ def print_world_model_training_dataset_summary(dataset, accelerator, label):
     #     )
 
 
+def resolve_world_model_cameras(args):
+    video_cameras = split_csv(args.world_model_video_camera) or (args.world_model_video_camera,)
+    multiview_cameras = video_cameras if len(video_cameras) > 1 else ()
+    cameras = list(split_csv(args.world_model_cameras) or ())
+    if len(cameras) == 0:
+        cameras = list(video_cameras)
+    for camera in video_cameras:
+        if camera not in cameras:
+            cameras.append(camera)
+    return tuple(cameras), multiview_cameras
+
+
+def multiview_frame_height(args, multiview_cameras):
+    if not multiview_cameras or args.height is None:
+        return args.height
+    view_count = len(multiview_cameras)
+    if args.height % view_count != 0:
+        raise ValueError(
+            f"--height must be divisible by the number of multiview cameras ({view_count}), "
+            f"got height={args.height}."
+        )
+    return args.height // view_count
+
+
 def build_unified_dataset(args):
     return UnifiedDataset(
         base_path=args.dataset_base_path,
@@ -384,9 +508,7 @@ def build_world_model_dataset(args):
     history_dropout_prob = validate_probability(args.world_model_history_dropout_prob, "--world_model_history_dropout_prob")
     if history_dropout_prob > 0.0 and history_frames == 0:
         raise ValueError("--world_model_history_dropout_prob requires --world_model_history_frames > 0.")
-    cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
-    if args.world_model_video_camera not in cameras:
-        cameras = (args.world_model_video_camera,) + cameras
+    cameras, multiview_cameras = resolve_world_model_cameras(args)
     action_metadata_path = args.action_metadata_path or default_action_metadata_path(
         args.dataset_base_path,
         metadata_key=args.action_metadata_key,
@@ -411,7 +533,7 @@ def build_world_model_dataset(args):
         action_delta_low_weight=args.world_model_action_delta_low_weight,
     )
     frame_processor = ImageCropAndResize(
-        height=args.height,
+        height=multiview_frame_height(args, multiview_cameras),
         width=args.width,
         max_pixels=args.max_pixels,
         height_division_factor=16,
@@ -420,10 +542,12 @@ def build_world_model_dataset(args):
     return WorldModelTrainingDataset(
         dataset,
         video_camera=args.world_model_video_camera,
+        multiview_cameras=multiview_cameras,
         frame_processor=frame_processor,
         history_frames=history_frames,
         history_stride=history_stride,
         history_dropout_prob=history_dropout_prob,
+        use_history_action=args.world_model_use_history_action,
     )
 
 
@@ -436,9 +560,7 @@ def build_eval_dataset(args):
 
     history_frames = validate_world_model_history_frames(args.world_model_history_frames)
     history_stride = validate_world_model_history_stride(args.world_model_history_stride)
-    cameras = split_csv(args.world_model_cameras) or (args.world_model_video_camera,)
-    if args.world_model_video_camera not in cameras:
-        cameras = (args.world_model_video_camera,) + cameras
+    cameras, multiview_cameras = resolve_world_model_cameras(args)
     dataset = WorldModelDataset(
         root=args.eval_dataset_base_path,
         tasks=split_csv(args.world_model_tasks),
@@ -452,7 +574,7 @@ def build_eval_dataset(args):
         max_data_items=args.eval_max_samples,
     )
     frame_processor = ImageCropAndResize(
-        height=args.height,
+        height=multiview_frame_height(args, multiview_cameras),
         width=args.width,
         max_pixels=args.max_pixels,
         height_division_factor=16,
@@ -461,10 +583,12 @@ def build_eval_dataset(args):
     return WorldModelTrainingDataset(
         dataset,
         video_camera=args.world_model_video_camera,
+        multiview_cameras=multiview_cameras,
         frame_processor=frame_processor,
         history_frames=history_frames,
         history_stride=history_stride,
         history_dropout_prob=0.0,
+        use_history_action=args.world_model_use_history_action,
     )
 
 
@@ -476,7 +600,12 @@ def build_dataset(args):
     history_frames = validate_world_model_history_frames(getattr(args, "world_model_history_frames", 0))
     history_stride = validate_world_model_history_stride(getattr(args, "world_model_history_stride", 4))
     history_dropout_prob = validate_probability(getattr(args, "world_model_history_dropout_prob", 0.0), "--world_model_history_dropout_prob")
-    if (history_frames > 0 or history_dropout_prob > 0.0) and dataset_type != "world_model":
+    cached_unified_dataset = (
+        dataset_type == "unified"
+        and args.dataset_metadata_path is None
+        and contains_cached_data_files(args.dataset_base_path)
+    )
+    if (history_frames > 0 or history_dropout_prob > 0.0) and dataset_type != "world_model" and not cached_unified_dataset:
         raise ValueError("--world_model_history_frames is only supported with --dataset_type=world_model.")
     if history_dropout_prob > 0.0 and history_frames == 0:
         raise ValueError("--world_model_history_dropout_prob requires --world_model_history_frames > 0.")
@@ -510,6 +639,35 @@ def resize_pil_video(video, width, height):
         return video
     resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
     return [frame.resize(target_size, resample=resample) for frame in video]
+
+
+def compose_frame_views(frames):
+    if len(frames) == 0:
+        raise ValueError("Cannot compose zero camera views.")
+    heights = [frame.size[1] for frame in frames]
+    if len(set(heights)) != 1:
+        raise ValueError(f"All view heights must match, got {heights}.")
+    width = sum(frame.size[0] for frame in frames)
+    height = heights[0]
+    canvas = Image.new("RGB", (width, height))
+    offset = 0
+    for frame in frames:
+        canvas.paste(frame.convert("RGB"), (offset, 0))
+        offset += frame.size[0]
+    return canvas
+
+
+def compose_video_views(video_views):
+    if len(video_views) == 0:
+        raise ValueError("Cannot compose zero camera video views.")
+    frame_count = len(video_views[0])
+    if any(len(video) != frame_count for video in video_views):
+        lengths = [len(video) for video in video_views]
+        raise ValueError(f"All video views must have the same frame count, got {lengths}.")
+    return [
+        compose_frame_views([video[frame_id] for video in video_views])
+        for frame_id in range(frame_count)
+    ]
 
 
 def FlowMatchWanWorldModelHistoryLoss(pipe, **inputs):
@@ -648,6 +806,8 @@ class WanWorldModelEvalCallback:
         self._ensure_fid_metric(device)
 
     def _reconstruct_video(self, pipe, video):
+        if len(video) > 0 and isinstance(video[0], (list, tuple)):
+            return compose_video_views([self._reconstruct_video(pipe, view) for view in video])
         pipe.load_models_to_device(["vae"])
         input_video = pipe.preprocess_video(video)
         latents = pipe.vae.encode(
@@ -667,7 +827,7 @@ class WanWorldModelEvalCallback:
         return pipe.vae_output_to_video(decoded)
 
     def _evaluate_sample(self, pipe, data, sample_id, step, video_paths, upload_videos):
-        x_gt = data["video"]
+        x_gt = compose_video_views(data["video_views"]) if "video_views" in data else data["video"]
         target_height, target_width, target_num_frames = pipe.check_resize_height_width(
             x_gt[0].size[1],
             x_gt[0].size[0],
@@ -679,6 +839,7 @@ class WanWorldModelEvalCallback:
             prompt=data.get("prompt", ""),
             negative_prompt="",
             input_image=x_gt[0],
+            input_image_views=data.get("input_image_views"),
             seed=sample_id,
             rand_device=pipe.device,
             height=target_height,
@@ -689,6 +850,9 @@ class WanWorldModelEvalCallback:
             tiled=False,
             action=data.get("action"),
             history_video=data.get("history_video"),
+            history_video_views=data.get("history_video_views"),
+            history_video_segments=data.get("history_video_segments"),
+            history_video_segments_views=data.get("history_video_segments_views"),
             history_action=data.get("history_action"),
             history_latent_count=data.get("history_latent_count", 0),
             progress_bar_cmd=lambda x: x,
@@ -697,7 +861,7 @@ class WanWorldModelEvalCallback:
         if len(x_pred) > 0 and x_pred[0].size != x_gt[0].size:
             x_gt = resize_pil_video(x_gt, x_pred[0].size[0], x_pred[0].size[1])
         if upload_videos and sample_id < self.num_videos_to_log:
-            x_reconst = self._reconstruct_video(pipe, x_gt)
+            x_reconst = self._reconstruct_video(pipe, data["video_views"] if "video_views" in data else x_gt)
             sample_dir = os.path.join(self.output_path, "eval_videos", f"step-{step}", f"sample_{sample_id}")
             paths = {
                 f"val_vis/sample_{sample_id}/x_gt": os.path.join(sample_dir, "x_gt.mp4"),
@@ -938,9 +1102,14 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         use_text_condition=True,
         text_context_length=512,
         world_model_history_frames=0,
+        world_model_history_dropout_prob=0.0,
     ):
         super().__init__()
         world_model_history_frames = validate_world_model_history_frames(world_model_history_frames)
+        world_model_history_dropout_prob = validate_probability(
+            world_model_history_dropout_prob,
+            "world_model_history_dropout_prob",
+        )
         if not use_gradient_checkpointing:
             warnings.warn("Gradient checkpointing is disabled. The training framework will enable it to reduce OOM risk.")
             use_gradient_checkpointing = True
@@ -990,7 +1159,25 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             redirect_common_files=True,
         )
         self.inference_units = list(self.pipe.units)
-        self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models)
+        world_model_loss_required_params = (
+            "input_latents",
+            "first_frame_latents",
+            "history_latents",
+            "history_latent_count",
+            "available_history_latent_count",
+            "history_frame_count_used",
+            "max_timestep_boundary",
+            "min_timestep_boundary",
+            "num_video_views",
+            "cfg_scale",
+        )
+        self.pipe = self.split_pipeline_units(
+            task,
+            self.pipe,
+            trainable_models,
+            remove_unnecessary_params=task.endswith(":data_process"),
+            loss_required_params=world_model_loss_required_params,
+        )
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
         self.use_text_condition = bool(use_text_condition)
 
@@ -1006,6 +1193,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.world_model_history_frames = world_model_history_frames
         self.world_model_history_latent_count = world_model_history_frames // 4
+        self.world_model_history_dropout_prob = world_model_history_dropout_prob
         self.extra_inputs = [item.strip() for item in extra_inputs.split(",") if item.strip()] if extra_inputs is not None else []
         if action_enabled and "action" not in self.extra_inputs:
             self.extra_inputs.append("action")
@@ -1062,7 +1250,10 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
         for extra_input in extra_inputs:
             if extra_input == "input_image":
                 # Wan2.2-TI2V-5B 的 I2V 条件直接取训练视频首帧，不要求 metadata 单独提供 image。
-                inputs_shared["input_image"] = data["video"][0]
+                if "input_image_views" in data:
+                    inputs_shared["input_image_views"] = data["input_image_views"]
+                else:
+                    inputs_shared["input_image"] = data["video"][0]
             elif extra_input == "action" and "action" not in data and "robot" in data:
                 inputs_shared["action"] = robot_action_to_tensor(data["robot"])
             else:
@@ -1072,9 +1263,11 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
     def get_pipeline_inputs(self, data):
         inputs_posi = {"prompt": data["prompt"] if self.use_text_condition else data.get("prompt", "")}
         inputs_nega = {}
+        video_views = data.get("video_views")
+        view_count = len(video_views) if video_views is not None else 1
         inputs_shared = {
             "input_video": data["video"],
-            "height": data["video"][0].size[1],
+            "height": data["video"][0].size[1] * view_count,
             "width": data["video"][0].size[0],
             "num_frames": len(data["video"]),
             "cfg_scale": 1,
@@ -1086,18 +1279,63 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             "min_timestep_boundary": self.min_timestep_boundary,
             "disable_context_attention": not self.use_text_condition,
         }
+        if video_views is not None:
+            inputs_shared["input_video_views"] = video_views
+            inputs_shared["num_video_views"] = view_count
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         if self.world_model_history_latent_count > 0:
             inputs_shared["history_video"] = data.get("history_video", [])
             inputs_shared["history_video_segments"] = data.get("history_video_segments")
+            if "history_video_views" in data:
+                inputs_shared["history_video_views"] = data["history_video_views"]
+            if "history_video_segments_views" in data:
+                inputs_shared["history_video_segments_views"] = data["history_video_segments_views"]
             inputs_shared["history_latent_count"] = data.get("history_latent_count", self.world_model_history_latent_count)
             if "history_action" in data:
                 inputs_shared["history_action"] = data["history_action"]
         return inputs_shared, inputs_posi, inputs_nega
 
+    @staticmethod
+    def _as_int(value, default=0):
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            return int(value.detach().flatten()[0].item())
+        return int(value)
+
+    def apply_cached_history_dropout(self, inputs):
+        if (
+            not self.training
+            or self.world_model_history_dropout_prob <= 0.0
+            or not isinstance(inputs, (list, tuple))
+            or len(inputs) != 3
+            or not isinstance(inputs[0], dict)
+        ):
+            return inputs
+        inputs_shared, inputs_posi, inputs_nega = inputs
+        history_latent_count = self._as_int(inputs_shared.get("history_latent_count"), default=0)
+        if history_latent_count <= 0 or inputs_shared.get("history_latents") is None:
+            return inputs
+        if not bool((torch.rand(()) < self.world_model_history_dropout_prob).item()):
+            return inputs
+
+        inputs_shared = dict(inputs_shared)
+        history_latents = inputs_shared.get("history_latents")
+        if torch.is_tensor(history_latents):
+            inputs_shared["history_latents"] = torch.zeros_like(history_latents)
+        inputs_shared["available_history_latent_count"] = 0
+        inputs_shared["history_frame_count_used"] = 0
+        inputs_shared["history_action"] = None
+        inputs_shared["history_dropped"] = True
+        return inputs_shared, inputs_posi, inputs_nega
+
     def forward(self, data, inputs=None):
         if inputs is None:
             inputs = self.get_pipeline_inputs(data)
+        else:
+            inputs = self.apply_cached_history_dropout(inputs)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
@@ -1137,8 +1375,13 @@ def wan_world_model_parser():
 
     # WorldModelDataset indexing and camera streams.
     parser.add_argument("--world_model_tasks", type=str, default=None, help="Comma-separated task folders to load from WorldModelDataset.")
-    parser.add_argument("--world_model_cameras", type=str, default=None, help="Comma-separated cameras to load. Defaults to --world_model_video_camera.")
-    parser.add_argument("--world_model_video_camera", type=str, default="head_camera", help="Camera RGB stream used as training video.")
+    parser.add_argument("--world_model_cameras", type=str, default=None, help="Comma-separated cameras to load. Defaults to all cameras listed by --world_model_video_camera.")
+    parser.add_argument(
+        "--world_model_video_camera",
+        type=str,
+        default="head_camera",
+        help="Camera RGB stream used as training video. Use a comma-separated list, e.g. head_camera,left_camera,right_camera, to train view-embedding multiview.",
+    )
     parser.add_argument("--world_model_stride", type=int, default=None, help="Stride between fixed-length world-model windows. Defaults to num_frames.")
     parser.add_argument(
         "--world_model_history_frames",
@@ -1157,6 +1400,13 @@ def wan_world_model_parser():
         type=float,
         default=0.0,
         help="Training-only probability of dropping all history RGB/action for a sample while keeping zero-padded history latent slots.",
+    )
+    parser.add_argument(
+        "--no_world_model_history_action",
+        dest="world_model_use_history_action",
+        default=True,
+        action="store_false",
+        help="Do not load or condition on robot actions from history frames. Current-window action conditioning remains enabled.",
     )
     parser.add_argument("--world_model_include_depth", default=False, action="store_true", help="Load depth arrays from WorldModelDataset.")
     parser.add_argument("--world_model_include_camera_params", default=False, action="store_true", help="Load camera intrinsics/extrinsics from WorldModelDataset.")
@@ -1353,6 +1603,7 @@ if __name__ == "__main__":
             use_text_condition=args.use_text_condition,
             text_context_length=args.text_context_length,
             world_model_history_frames=args.world_model_history_frames,
+            world_model_history_dropout_prob=args.world_model_history_dropout_prob,
         )
     accelerator.wait_for_everyone()
     model_logger = ModelLogger(

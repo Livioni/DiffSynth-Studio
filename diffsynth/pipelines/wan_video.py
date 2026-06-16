@@ -16,7 +16,13 @@ from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig, gradient_checkpoint_forward
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
-from ..models.wan_video_dit import WanModel, normalize_action_injection_method, sinusoidal_embedding_1d
+from ..models.wan_video_dit import (
+    WanModel,
+    add_wan_video_view_embeddings,
+    build_wan_video_freqs,
+    normalize_action_injection_method,
+    sinusoidal_embedding_1d,
+)
 from ..models.wan_video_dit_s2v import rope_precompute
 from ..models.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 from ..models.wan_video_vae import WanVideoVAE
@@ -1358,6 +1364,7 @@ def model_fn_wan_video(
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
     clean_prefix_latent_count: Optional[int] = None,
+    num_video_views: int = 1,
     wantodance_refimage_feature = None,
     wantodance_fps: float = 30.0,
     music_feature = None,
@@ -1384,6 +1391,7 @@ def model_fn_wan_video(
             tea_cache=tea_cache,
             use_unified_sequence_parallel=use_unified_sequence_parallel,
             motion_bucket_id=motion_bucket_id,
+            num_video_views=num_video_views,
             disable_context_attention=disable_context_attention,
         )
         return TemporalTiler_BCTHW().run(
@@ -1500,6 +1508,8 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
 
+    x = add_wan_video_view_embeddings(dit, x, f, h, w, num_video_views=num_video_views)
+
     action_cond = prepare_wan_action_condition(
         dit=dit,
         action_emb=action_emb,
@@ -1511,11 +1521,7 @@ def model_fn_wan_video(
         prepend_token_count=reference_latents.shape[1] if reference_latents is not None else 0,
     )
     
-    freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    freqs = build_wan_video_freqs(dit.freqs, f, h, w, x.device, num_video_views=num_video_views)
 
     # VAP 
     if vap is not None:
@@ -1549,11 +1555,15 @@ def model_fn_wan_video(
             context = torch.cat([refimage_feature_embedding, context], dim=1)
         if (dit.wantodance_enable_dynamicfps or dit.wantodance_enable_unimodel) and int(wantodance_fps + 0.5) != 30: 
             freqs_0 = wantodance_get_single_freqs(dit.freqs[0], f, wantodance_fps)
-            freqs = torch.cat([
-                freqs_0.view(f, 1, 1, -1).expand(f, h, w, -1),
-                dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+            freqs = build_wan_video_freqs(
+                dit.freqs,
+                f,
+                h,
+                w,
+                x.device,
+                num_video_views=num_video_views,
+                frame_freqs=freqs_0,
+            )
         if dit.wantodance_enable_global or dit.wantodance_enable_dynamicfps or dit.wantodance_enable_unimodel:
             if use_unified_sequence_parallel:
                 length = int(float(music_feature.shape[0]) / get_sequence_parallel_world_size()) * get_sequence_parallel_world_size()

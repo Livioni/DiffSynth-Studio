@@ -92,6 +92,39 @@ def get_dataset_sample_weights(dataset):
     return sample_weights
 
 
+def dataloader_worker_kwargs(num_workers, args=None):
+    kwargs = {"num_workers": num_workers}
+    if num_workers <= 0:
+        return kwargs
+    prefetch_factor = getattr(args, "dataset_prefetch_factor", 2) if args is not None else 2
+    if prefetch_factor is not None and int(prefetch_factor) > 0:
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+    disable_persistent_workers = (
+        getattr(args, "disable_dataset_persistent_workers", False) if args is not None else False
+    )
+    if not disable_persistent_workers:
+        kwargs["persistent_workers"] = True
+    return kwargs
+
+
+def sample_weight_from_data(data):
+    if isinstance(data, dict):
+        return data.get("sample_weight")
+    if isinstance(data, (list, tuple)) and len(data) > 0:
+        return sample_weight_from_data(data[0])
+    return None
+
+
+def sample_weight_to_float(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        return float(value.detach().flatten()[0].cpu().item())
+    return float(value)
+
+
 def print_weighted_sampler_plan(accelerator: Accelerator, sample_weights):
     if not accelerator.is_main_process or sample_weights is None:
         return
@@ -376,15 +409,16 @@ def launch_training_task(
     prepare_scheduler_with_accelerator = lr_scheduler == "constant"
     scheduler = get_lr_scheduler(optimizer, lr_scheduler) if prepare_scheduler_with_accelerator else None
     sample_weights = get_dataset_sample_weights(dataset)
+    dataloader_kwargs = dataloader_worker_kwargs(num_workers, args=args)
     if sample_weights is None:
-        dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+        dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], **dataloader_kwargs)
     else:
         sampler = torch.utils.data.WeightedRandomSampler(
             torch.as_tensor(sample_weights, dtype=torch.double),
             num_samples=len(sample_weights),
             replacement=True,
         )
-        dataloader = torch.utils.data.DataLoader(dataset, sampler=sampler, collate_fn=lambda x: x[0], num_workers=num_workers)
+        dataloader = torch.utils.data.DataLoader(dataset, sampler=sampler, collate_fn=lambda x: x[0], **dataloader_kwargs)
         print_weighted_sampler_plan(accelerator, sample_weights)
     dataset_length = safe_len(dataset)
     dataloader_batches_before_shard = safe_len(dataloader)
@@ -520,7 +554,12 @@ def launch_data_process_task(
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
         
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        shuffle=False,
+        collate_fn=lambda x: x[0],
+        **dataloader_worker_kwargs(num_workers, args=args),
+    )
     if enable_model_cpu_offload:
         dataloader = accelerator.prepare(dataloader)
         offload_manager = OffloadTrainingManager(model, accelerator.device, enable_optimizer_cpu_offload, cpu_offload_split_threshold)
@@ -529,16 +568,27 @@ def launch_data_process_task(
         model.to(device=accelerator.device)
         model, dataloader = accelerator.prepare(model, dataloader)
     
-    for data_id, data in enumerate(tqdm(dataloader)):
-        with accelerator.accumulate(model):
-            with torch.no_grad():
-                folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
-                os.makedirs(folder, exist_ok=True)
-                save_path = os.path.join(model_logger.output_path, str(accelerator.process_index), f"{data_id}.pth")
-                data = model(data)
-                torch.save(data, save_path)
-                if enable_model_cpu_offload:
-                    offload_manager.after_backward()
+    folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
+    os.makedirs(folder, exist_ok=True)
+    manifest_path = os.path.join(folder, "manifest.jsonl")
+    manifest_file = open(manifest_path, "w")
+    try:
+        for data_id, data in enumerate(tqdm(dataloader)):
+            sample_weight = sample_weight_to_float(sample_weight_from_data(data))
+            with accelerator.accumulate(model):
+                with torch.no_grad():
+                    save_path = os.path.join(folder, f"{data_id}.pth")
+                    data = model(data)
+                    torch.save(data, save_path)
+                    manifest_entry = {"path": os.path.basename(save_path)}
+                    if sample_weight is not None:
+                        manifest_entry["sample_weight"] = sample_weight
+                    manifest_file.write(json.dumps(manifest_entry) + "\n")
+                    manifest_file.flush()
+                    if enable_model_cpu_offload:
+                        offload_manager.after_backward()
+    finally:
+        manifest_file.close()
 
 def initialize_deepspeed_gradient_checkpointing(accelerator: Accelerator):
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
