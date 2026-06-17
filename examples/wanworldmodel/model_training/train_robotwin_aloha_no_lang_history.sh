@@ -12,7 +12,7 @@ export TOKENIZERS_PARALLELISM=false
 # =========================
 # accelerate
 # =========================
-num_processes=4   # 启动的训练进程数，通常等于 GPU 数。
+num_processes=6   # 启动的训练进程数，通常等于 GPU 数。
 num_machines=1  # 单机训练。
 mixed_precision="bf16"  # accelerate 混合精度模式；bf16 避免裸 bf16 参数训练路径。
 dynamo_backend="no"  # 不启用 torch dynamo。
@@ -26,7 +26,7 @@ log_path="${output_path}/train.log"  # shell stdout/stderr 保存路径。
 # =========================
 # dataset
 # =========================
-dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/fail_set,world_model_data/robotwin_aloha/clean_set"  # 训练数据根目录，多个 root 用逗号分隔。
+dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/fail_set"  # 训练数据根目录，多个 root 用逗号分隔。
 dataset_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # unified 数据集 metadata 路径；world_model 模式通常留空。
 dataset_type="world_model"  # 数据集类型：auto、unified 或 world_model。
 dataset_repeat=3  # 每个 epoch 内虚拟重复数据集的次数，用于增加训练步数。
@@ -69,7 +69,7 @@ tokenizer_path=""  # no-language 训练不需要 tokenizer。
 extra_inputs="input_image"  # 额外传给模型的输入字段，逗号分隔。
 fp8_models=""  # 使用 FP8 加载的模型名或路径，逗号分隔。
 offload_models=""  # split training 中需要 offload 的模型，逗号分隔。
-resume_from_checkpoint="outputs/WanWorldModel_film_no_language_abs_action_fix_resume2/step-100000.safetensors"  # 只加载模型权重的 checkpoint 文件；不恢复 optimizer/step。
+resume_from_checkpoint="models/WanWorldModel_film_action_pretrain_100000/step-100000.safetensors"  # 只加载模型权重的 checkpoint 文件；不恢复 optimizer/step。
 initialize_model_on_cpu=false  # 是否先在 CPU 初始化模型。
 
 # =========================

@@ -3,7 +3,7 @@
 1. rollout a video
 
 ```bash
-python examples/wanworldmodel/rollout.py --task beat_block_hammer --episode episode55 --num_inference_steps 500
+python examples/wanworldmodel/rollout.py --task beat_block_hammer --episode episode55 --checkpoint_path outputs/WanWorldModel_film_w_history/step-40000.safetensors --history --fps 25
 ```
 
 ## 常用工作流

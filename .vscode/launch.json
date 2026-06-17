@@ -209,6 +209,32 @@
         "--extra_inputs",
         "input_image"
       ]
+    },
+    {
+      "name": "WanWorldModel rollout beat_block_hammer episode55",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/wanworldmodel/rollout.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "DIFFSYNTH_MODEL_BASE_PATH": "${workspaceFolder}/models",
+        "DIFFSYNTH_SKIP_DOWNLOAD": "True",
+        "TOKENIZERS_PARALLELISM": "false"
+      },
+      "args": [
+        "--task",
+        "beat_block_hammer",
+        "--episode",
+        "episode55",
+        "--checkpoint_path",
+        "outputs/WanWorldModel_film_w_history/step-40000.safetensors",
+        "--history",
+        "--fps",
+        "25"
+      ]
     }
   ]
 }

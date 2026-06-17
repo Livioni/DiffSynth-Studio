@@ -397,13 +397,15 @@ def run(args):
     action = robot_action_to_tensor(data["robot"])
     if action is None:
         raise ValueError(f"No robot action found in sample {data['task']}/{data['episode']}.")
+    history_frames = validate_world_model_history_frames(args.world_model_history_frames if args.history else 0)
+    history_stride = validate_world_model_history_stride(args.world_model_history_stride)
     history_video, history_video_segments, history_action, history_latent_count, history_frame_indices = load_history_inputs(
         dataset,
         frame_processor,
         data,
         args.camera,
-        args.world_model_history_frames,
-        args.world_model_history_stride,
+        history_frames,
+        history_stride,
     )
 
     prompt = args.prompt if args.prompt is not None else selected_episode.text_conditions[0]
@@ -451,6 +453,7 @@ def run(args):
             task_name,
             episode_name,
             f"start{int(args.start_frame)}",
+            f"history{int(history_frames)}",
             f"step_{int(args.num_inference_steps):04d}",
             f"seed{int(args.seed) if args.seed is not None else 'none'}",
         ]
@@ -478,9 +481,11 @@ def run(args):
         "use_text_condition": bool(args.use_text_condition),
         "start_frame": int(args.start_frame),
         "frame_indices": [int(item) for item in data["frame_indices"].tolist()],
+        "history_enabled": bool(args.history),
         "history_frame_indices": history_frame_indices,
         "history_latent_count": int(history_latent_count),
-        "history_stride": int(args.world_model_history_stride),
+        "history_frames_requested": int(history_frames),
+        "history_stride": int(history_stride),
         "num_frames_requested": int(args.num_frames),
         "num_frames_generated": int(len(pred_video)),
         "height": int(target_height),
@@ -520,25 +525,38 @@ def build_parser():
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--num_frames", type=int, default=25)
+    parser.set_defaults(history=False)
+    parser.add_argument(
+        "--history",
+        dest="history",
+        action="store_true",
+        help="Enable causal VAE history conditioning for this one-chunk rollout.",
+    )
+    parser.add_argument(
+        "--no_history",
+        dest="history",
+        action="store_false",
+        help="Disable causal VAE history conditioning.",
+    )
     parser.add_argument(
         "--world_model_history_frames",
         type=int,
-        default=0,
+        default=16,
         help="Number of RGB frames before the selected window used as causal VAE history. Must be divisible by 4; 16 gives 4 history latents.",
     )
     parser.add_argument(
         "--world_model_history_stride",
         type=int,
-        default=4,
-        help="Distance in raw frames between consecutive 4-frame history blocks. The default 4 keeps contiguous history; values >4 sparsify history.",
+        default=8,
+        help="Distance in raw frames between consecutive 4-frame history blocks. The default 8 matches the history training script; use 4 for contiguous history.",
     )
     parser.add_argument("--fps", type=int, default=25)
 
-    parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_film_no_language_abs_action_fix_resume2/step-100000.safetensors")
+    parser.add_argument("--checkpoint_path", type=str, default="outputs/WanWorldModel_film_w_history/step-40000.safetensors")
     parser.add_argument("--output_dir", type=str, default="outputs/inference")
     parser.add_argument("--dit_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors")
-    parser.add_argument("--text_encoder_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/models_t5_umt5-xxl-enc-bf16.safetensors")
-    parser.add_argument("--vae_path", type=str, default="models/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors")
+    parser.add_argument("--text_encoder_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth")
+    parser.add_argument("--vae_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth")
     parser.add_argument("--tokenizer_path", type=str, default="models/Wan-AI/Wan2.2-TI2V-5B/google/umt5-xxl")
     parser.add_argument("--strict_checkpoint", default=False, action="store_true")
     parser.add_argument(

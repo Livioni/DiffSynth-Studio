@@ -482,13 +482,17 @@ def multiview_frame_height(args, multiview_cameras):
 
 
 def build_unified_dataset(args):
+    base_path = args.dataset_base_path
+    cached_base_path = getattr(args, "cached_dataset_base_path", None)
+    if args.dataset_metadata_path is None and cached_base_path:
+        base_path = cached_base_path
     return UnifiedDataset(
-        base_path=args.dataset_base_path,
+        base_path=base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
         main_data_operator=UnifiedDataset.default_video_operator(
-            base_path=args.dataset_base_path,
+            base_path=base_path,
             max_pixels=args.max_pixels,
             height=args.height,
             width=args.width,
@@ -603,7 +607,7 @@ def build_dataset(args):
     cached_unified_dataset = (
         dataset_type == "unified"
         and args.dataset_metadata_path is None
-        and contains_cached_data_files(args.dataset_base_path)
+        and contains_cached_data_files(getattr(args, "cached_dataset_base_path", None) or args.dataset_base_path)
     )
     if (history_frames > 0 or history_dropout_prob > 0.0) and dataset_type != "world_model" and not cached_unified_dataset:
         raise ValueError("--world_model_history_frames is only supported with --dataset_type=world_model.")
@@ -827,32 +831,58 @@ class WanWorldModelEvalCallback:
         return pipe.vae_output_to_video(decoded)
 
     def _evaluate_sample(self, pipe, data, sample_id, step, video_paths, upload_videos):
-        x_gt = compose_video_views(data["video_views"]) if "video_views" in data else data["video"]
-        target_height, target_width, target_num_frames = pipe.check_resize_height_width(
-            x_gt[0].size[1],
-            x_gt[0].size[0],
-            len(x_gt),
-            verbose=False,
-        )
-        x_gt = resize_pil_video(x_gt, target_width, target_height)
+        video_views = data.get("video_views")
+        if video_views is not None:
+            view_count = len(video_views)
+            x_gt = compose_video_views(video_views)
+            input_image = None
+            input_image_views = data.get("input_image_views") or [video[0] for video in video_views]
+            history_video = None
+            history_video_segments = None
+            history_video_views = data.get("history_video_views")
+            history_video_segments_views = data.get("history_video_segments_views")
+            view_height, view_width, target_num_frames = pipe.check_resize_height_width(
+                video_views[0][0].size[1],
+                video_views[0][0].size[0],
+                len(x_gt),
+                verbose=False,
+            )
+            pipe_height = view_height * view_count
+            pipe_width = view_width
+            x_gt = resize_pil_video(x_gt, view_width * view_count, view_height)
+        else:
+            x_gt = data["video"]
+            input_image = x_gt[0]
+            input_image_views = None
+            history_video = data.get("history_video")
+            history_video_segments = data.get("history_video_segments")
+            history_video_views = None
+            history_video_segments_views = None
+            pipe_height, pipe_width, target_num_frames = pipe.check_resize_height_width(
+                x_gt[0].size[1],
+                x_gt[0].size[0],
+                len(x_gt),
+                verbose=False,
+            )
+            x_gt = resize_pil_video(x_gt, pipe_width, pipe_height)
         x_pred = pipe(
             prompt=data.get("prompt", ""),
             negative_prompt="",
-            input_image=x_gt[0],
-            input_image_views=data.get("input_image_views"),
+            input_image=input_image,
+            input_image_views=input_image_views,
             seed=sample_id,
             rand_device=pipe.device,
-            height=target_height,
-            width=target_width,
+            height=pipe_height,
+            width=pipe_width,
             num_frames=target_num_frames,
             cfg_scale=1,
             num_inference_steps=self.num_inference_steps,
             tiled=False,
             action=data.get("action"),
-            history_video=data.get("history_video"),
-            history_video_views=data.get("history_video_views"),
-            history_video_segments=data.get("history_video_segments"),
-            history_video_segments_views=data.get("history_video_segments_views"),
+            history_video=history_video,
+            history_video_views=history_video_views,
+            history_video_segments=history_video_segments,
+            history_video_segments_views=history_video_segments_views,
             history_action=data.get("history_action"),
             history_latent_count=data.get("history_latent_count", 0),
             progress_bar_cmd=lambda x: x,
@@ -1156,7 +1186,7 @@ class WanWorldModelTrainingModule(DiffusionTrainingModule):
             action_normalization_mode=action_normalization_mode,
             use_text_condition=use_text_condition,
             text_context_length=text_context_length,
-            redirect_common_files=True,
+            redirect_common_files=False,
         )
         self.inference_units = list(self.pipe.units)
         world_model_loss_required_params = (
@@ -1371,6 +1401,12 @@ def wan_world_model_parser():
         default="world_model",
         choices=("auto", "unified", "world_model"),
         help="Dataset backend. Defaults to WorldModelDataset. Use `unified` for metadata/cached data, or `auto` to detect it.",
+    )
+    parser.add_argument(
+        "--cached_dataset_base_path",
+        type=str,
+        default="outputs/WanWorldModel_film_w_history_multiview_cache",
+        help="Cached UnifiedDataset root used when --dataset_type=unified and --dataset_metadata_path is empty.",
     )
 
     # WorldModelDataset indexing and camera streams.

@@ -7,23 +7,29 @@ try:
     from examples.wanworldmodel.action_utils import robot_action_to_tensor
     from examples.wanworldmodel.infer import (
         build_pipeline,
+        build_history_frame_segments,
         none_if_empty,
         resize_pil_video,
         sanitize_name,
         save_action,
         save_pil_video,
         split_csv,
+        validate_world_model_history_frames,
+        validate_world_model_history_stride,
     )
 except ModuleNotFoundError:
     from action_utils import robot_action_to_tensor
     from infer import (
         build_pipeline,
+        build_history_frame_segments,
         none_if_empty,
         resize_pil_video,
         sanitize_name,
         save_action,
         save_pil_video,
         split_csv,
+        validate_world_model_history_frames,
+        validate_world_model_history_stride,
     )
 
 
@@ -116,6 +122,53 @@ def pad_action_window(action, start, length):
     return torch.cat([window, pad], dim=0)
 
 
+def select_rollout_history(known_video, known_frame_indices, known_action, history_frames, history_stride):
+    history_frames = validate_world_model_history_frames(history_frames)
+    history_stride = validate_world_model_history_stride(history_stride)
+    history_latent_count = history_frames // 4
+    if history_latent_count == 0:
+        return [], None, None, 0, []
+
+    history_end = len(known_video)
+    if history_end <= 0:
+        return [], None, None, history_latent_count, []
+
+    if history_stride == 4:
+        selected_indices = list(range(max(0, history_end - history_frames), history_end))
+        history_video = [known_video[index] for index in selected_indices]
+        history_video_segments = None
+    else:
+        segments = build_history_frame_segments(history_end, history_latent_count, history_stride)
+        selected_indices = []
+        history_video_segments = []
+        for segment in segments:
+            segment_indices = [int(item) for item in segment.tolist() if 0 <= int(item) < history_end]
+            if len(segment_indices) < 4:
+                continue
+            selected_indices.extend(segment_indices)
+            history_video_segments.append([known_video[index] for index in segment_indices])
+        history_video = [frame for segment in history_video_segments for frame in segment]
+
+    history_action = None
+    if known_action is not None and len(selected_indices) > 0:
+        action_indices = torch.tensor(selected_indices, dtype=torch.long)
+        valid_mask = action_indices < known_action.shape[0]
+        if bool(valid_mask.all()):
+            history_action = known_action.index_select(0, action_indices)
+
+    selected_frame_indices = [
+        int(known_frame_indices[index]) for index in selected_indices
+    ] if known_frame_indices is not None else selected_indices
+
+    return (
+        history_video,
+        history_video_segments,
+        history_action,
+        history_latent_count,
+        selected_frame_indices,
+    )
+
+
 def rollout_episode(args):
     dataset, frame_processor = build_rollout_dataset(args)
     if args.list_samples:
@@ -135,6 +188,8 @@ def rollout_episode(args):
         start_frame=args.start_frame,
     )
     prompt = args.prompt if args.prompt is not None else episode.text_conditions[0]
+    history_frames = validate_world_model_history_frames(args.world_model_history_frames if args.history else 0)
+    history_stride = validate_world_model_history_stride(args.world_model_history_stride)
 
     pipe, device = build_pipeline(args)
     target_height, target_width, rollout_window_frames = pipe.check_resize_height_width(
@@ -180,6 +235,24 @@ def rollout_episode(args):
 
             input_image = gt_video[0] if len(pred_video) == 0 else pred_video[-1]
             action_window = pad_action_window(action, local_start, target_window_frames)
+            known_video = pred_video[:local_start]
+            known_frame_indices = [
+                int(args.start_frame + index) for index in range(local_start)
+            ]
+            known_action = action[:local_start] if local_start > 0 else None
+            (
+                history_video,
+                history_video_segments,
+                history_action,
+                history_latent_count,
+                history_frame_indices,
+            ) = select_rollout_history(
+                known_video,
+                known_frame_indices,
+                known_action,
+                history_frames,
+                history_stride,
+            )
             window_index = len(window_infos)
             window_seed = None if args.seed is None else int(args.seed) + window_index
             chunk_video = pipe(
@@ -199,6 +272,10 @@ def rollout_episode(args):
                 tile_size=tuple(args.tile_size),
                 tile_stride=tuple(args.tile_stride),
                 action=action_window,
+                history_video=history_video,
+                history_video_segments=history_video_segments,
+                history_action=history_action,
+                history_latent_count=history_latent_count,
                 output_type="quantized",
             )
             if len(chunk_video) == 0:
@@ -230,6 +307,11 @@ def rollout_episode(args):
                 "kept_rollout_frames_after_window": int(kept_until),
                 "seed": window_seed,
                 "action_shape": [int(item) for item in action_window.shape],
+                "history_enabled": bool(args.history),
+                "history_latent_count": int(history_latent_count),
+                "history_frame_count": int(len(history_video)),
+                "history_action_shape": [int(item) for item in history_action.shape] if history_action is not None else None,
+                "history_frame_indices": [int(item) for item in history_frame_indices],
             }
             window_infos.append(window_info)
 
@@ -271,6 +353,10 @@ def rollout_episode(args):
         "ground_truth_frame_count": int(len(gt_video)),
         "num_frames_requested_per_window": int(args.num_frames),
         "num_frames_generated_per_full_window": int(rollout_window_frames),
+        "history_enabled": bool(args.history),
+        "history_source": "rollout_prediction",
+        "history_frames_requested": int(history_frames),
+        "history_stride": int(history_stride),
         "height": int(target_height),
         "width": int(target_width),
         "seed": args.seed,
@@ -303,7 +389,36 @@ def build_parser():
 
     parser = build_infer_parser()
     parser.description = "Roll out a complete WanWorldModel episode with its action trajectory."
-    parser.set_defaults(output_dir="outputs/rollout")
+    parser.set_defaults(
+        output_dir="outputs/rollout",
+        eval_dataset_base_path="world_model_data/robotwin_aloha/val_set",
+        task=None,
+        episode=None,
+        camera="head_camera",
+        include_failed=True,
+        height=256,
+        width=320,
+        max_pixels=1048576,
+        num_frames=25,
+        world_model_history_frames=16,
+        world_model_history_stride=8,
+        fps=4,
+        checkpoint_path="outputs/WanWorldModel_film_w_history/step-40000.safetensors",
+        dit_path="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors",
+        vae_path="models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+        tokenizer_path="",
+        use_text_condition=False,
+        text_context_length=512,
+        action_dim=14,
+        action_embedder_hidden_dim=None,
+        action_injection_method="film",
+        action_metadata_path="world_model_data/robotwin_aloha/metadata.json",
+        action_metadata_key="robot_statistics",
+        action_normalization_eps=1e-6,
+        action_normalization_mode="standard",
+        torch_dtype="bf16",
+        num_inference_steps=50,
+    )
     parser.add_argument(
         "--save_windows",
         default=False,
@@ -316,6 +431,11 @@ def build_parser():
             action.help = "Episode frame used as the rollout anchor. Defaults to 0 for the full episode."
         elif action.dest == "num_frames":
             action.help = "Frames generated per rollout window before overlapping the last frame into the next window."
+        elif action.dest == "history":
+            if "--no_history" in action.option_strings:
+                action.help = "Disable causal VAE history conditioning during rollout."
+            else:
+                action.help = "Enable causal VAE history conditioning during rollout. Uses --world_model_history_frames and --world_model_history_stride."
         elif action.dest == "list_samples":
             action.help = "List task/episode lengths and exit."
     return parser

@@ -12,7 +12,7 @@ export TOKENIZERS_PARALLELISM=false
 # =========================
 # accelerate
 # =========================
-num_processes=4   # 启动的训练进程数，通常等于 GPU 数。
+num_processes=6   # 启动的训练进程数，通常等于 GPU 数。
 num_machines=1  # 单机训练。
 mixed_precision="bf16"  # accelerate 混合精度模式；bf16 避免裸 bf16 参数训练路径。
 dynamo_backend="no"  # 不启用 torch dynamo。
@@ -24,11 +24,12 @@ cache_output_path="./outputs/WanWorldModel_film_w_history_multiview_cache"  # �
 output_path="./outputs/WanWorldModel_film_w_history_multiview_cached"  # 第二阶段模型、日志、评估视频和断点输出目录。
 cache_log_path="${cache_output_path}/train.log"  # cache 阶段 shell stdout/stderr 保存路径。
 log_path="${output_path}/train.log"  # train 阶段 shell stdout/stderr 保存路径。
+run_cache_stage=false  # false 时直接使用已有 cached_dataset_base_path；true 时先重新生成缓存。
 
 # =========================
 # dataset
 # =========================
-dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/fail_set,world_model_data/robotwin_aloha/clean_set"  # 原始训练数据根目录，多个 root 用逗号分隔。
+dataset_base_path="world_model_data/robotwin_aloha/train_set,world_model_data/robotwin_aloha/fail_set"  # 原始训练数据根目录，多个 root 用逗号分隔。
 cached_dataset_base_path="${cache_output_path}"  # 第二阶段读取的缓存数据目录。
 dataset_metadata_path="world_model_data/robotwin_aloha/metadata.json"  # unified 数据集 metadata 路径；world_model 模式通常留空。
 cache_dataset_type="world_model"  # cache 阶段读取原始 world_model 数据。
@@ -43,7 +44,7 @@ data_file_keys="video"  # unified 数据集读取的数据字段，world_model �
 # =========================
 # world model dataset
 # =========================
-world_model_tasks="adjust_bottle"  # 只加载指定 task，逗号分隔；留空表示加载全部 task。
+world_model_tasks=""  # 只加载指定 task，逗号分隔；留空表示加载全部 task。
 world_model_cameras=""  # 要加载的 camera 列表，逗号分隔；留空加载 world_model_video_camera 中的全部 camera。
 world_model_video_camera="left_camera,head_camera,right_camera"  # 训练视频 camera；多个 camera 会按 Ctrl-World 风格在 latent 高度维堆叠成 multiview。
 world_model_stride="6"  # 固定长度窗口滑动步长；留空默认等于 num_frames。
@@ -77,7 +78,7 @@ tokenizer_path=""  # no-language 训练不需要 tokenizer。
 extra_inputs="input_image"  # 额外传给模型的输入字段，逗号分隔。
 fp8_models=""  # 使用 FP8 加载的模型名或路径，逗号分隔。
 offload_models=""  # split training 中需要 offload 的模型，逗号分隔。
-resume_from_checkpoint="outputs/WanWorldModel_film_no_language_abs_action_fix_resume2/step-100000.safetensors"  # train 阶段只加载模型权重的 checkpoint 文件；不恢复 optimizer/step。
+resume_from_checkpoint="outputs/WanWorldModel_film_w_history/step-40000.safetensors"  # train 阶段只加载模型权重的 checkpoint 文件；不恢复 optimizer/step。
 initialize_model_on_cpu=false  # 是否先在 CPU 初始化模型。
 
 # =========================
@@ -167,7 +168,7 @@ cpu_offload_split_threshold=""  # 大模块递归拆分阈值，单位 MB；留�
 enable_tensorboard_log=true  # 是否启用 TensorBoard。
 enable_swanlab_log=false  # 是否启用 SwanLab。
 swanlab_project="DiffSynth-Studio"  # SwanLab project 名。
-enable_wandb_log=false  # 是否启用 Weights & Biases。
+enable_wandb_log=true  # 是否启用 Weights & Biases。
 wandb_project="WanWorldModel"  # WandB project 名。
 
 current_args_name=""
@@ -339,7 +340,8 @@ train_args=(
 use_args train_args
 
 # Dataset
-add_arg --dataset_base_path "${cached_dataset_base_path}"
+add_arg --dataset_base_path "${dataset_base_path}"
+add_arg --cached_dataset_base_path "${cached_dataset_base_path}"
 add_arg --dataset_type "${train_dataset_type}"
 add_arg --dataset_repeat "${dataset_repeat}"
 add_common_args
@@ -371,5 +373,20 @@ add_inverse_flag --disable_training_checkpoint "${save_training_checkpoint}"
 add_optional_arg --resume_training_checkpoint "${resume_training_checkpoint}"
 add_optional_arg --training_checkpoint_dir "${training_checkpoint_dir}"
 
-accelerate launch "${accelerate_args[@]}" "${cache_args[@]}" 2>&1 | tee "${cache_log_path}"
+if [[ "${run_cache_stage}" == true ]]; then
+  accelerate launch "${accelerate_args[@]}" "${cache_args[@]}" 2>&1 | tee "${cache_log_path}"
+else
+  if [[ ! -d "${cached_dataset_base_path}" ]]; then
+    echo "Cached dataset directory does not exist: ${cached_dataset_base_path}" >&2
+    echo "Set run_cache_stage=true to generate it first." >&2
+    exit 1
+  fi
+  cache_marker="$(find "${cached_dataset_base_path}" \( -name manifest.jsonl -o -name '*.pth' \) -print -quit)"
+  if [[ -z "${cache_marker}" ]]; then
+    echo "No cached dataset files found under: ${cached_dataset_base_path}" >&2
+    echo "Set run_cache_stage=true to generate the cache first." >&2
+    exit 1
+  fi
+  echo "Using cached dataset from ${cached_dataset_base_path}"
+fi
 accelerate launch "${accelerate_args[@]}" "${train_args[@]}" 2>&1 | tee "${log_path}"
